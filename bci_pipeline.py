@@ -132,7 +132,7 @@ class UnicornConfig:
     # Alpha (8–13 Hz) + Beta (13–30 Hz) = 8–30 Hz combined band.
     # High-Gamma (>70 Hz) is heavily attenuated by the skull (≈40 dB/decade),
     # dura, CSF, and scalp, so it is physiologically inaccessible at the scalp.
-    ab_band: Tuple[float, float] = (8.0, 30.0)
+    ab_band: Tuple[float, float] = (1.0, 50.0)
     # Butterworth order 4 → −80 dB/decade roll-off; sufficient for Alpha/Beta
     # without excessive filter ringing on the short 1.2 s epoch window.
     butter_order: int = 4
@@ -296,22 +296,12 @@ class ECoGProcessor(SignalProcessor):
         """
         Ingest Walk.mat into an MNE RawArray with strict OOM prevention.
 
-        Walk.mat layout  (346 903 samples × 164 columns, float64, ~430 MB on disk):
+        Walk.mat layout  (346 903 samples × 164 columns, float64):
           y[:, 0]        — Time vector           → discard
           y[:, 1:161]    — 160 ECoG electrodes   → ECoG channels
           y[:, 161]      — Photodiode (0/1)       → STIM channel "Photodiode"
           y[:, 162]      — StimCode (1/2/3)       → STIM channel "StimCode"
           y[:, 163]      — GroupId                → discard
-
-        Memory budget (float32, n_samples=346 903):
-          160 ch ECoG  :  160 × 346 903 × 4 B  ≈  222 MB
-          2  aux rows  :    2 × 346 903 × 4 B  ≈    3 MB
-          Peak (during slice + copy + del original) ≈ 650 MB — safe on 8 GB.
-
-        The critical window is between sio.loadmat() returning the full float64
-        dict (≈430 MB) and the moment we `del mat` — during that window we hold
-        both the float64 original and the float32 copy.  The explicit del+GC
-        below collapses that window to a single statement.
         """
         cfg = self.cfg
         sfreq = cfg.sfreq_expected
@@ -592,6 +582,27 @@ class ECoGProcessor(SignalProcessor):
         # preload=False: MNE stores only the event table in RAM; the (n_epochs ×
         # 160 ch × 1441 samples) tensor (~800 MB at float32) is NEVER materialised
         # — it is streamed in chunks inside _build_features().
+
+        # Build the reject dict only when a threshold is configured.
+        # MNE expects amplitudes in Volts; EpochConfig stores µV, so divide by 1e6.
+        # Passing reject=None disables rejection entirely (MNE default behaviour).
+        reject_threshold = (
+            {"ecog": self.epoch_cfg.reject_peak_pv * 1e-6}
+            if self.epoch_cfg.reject_peak_pv is not None
+            else None
+        )
+        if reject_threshold is not None:
+            log.info(
+                "  Artifact rejection enabled: peak-to-peak threshold = %.1f µV",
+                self.epoch_cfg.reject_peak_pv,
+            )
+        else:
+            log.warning(
+                "  Artifact rejection DISABLED (EpochConfig.reject_peak_pv is None). "
+                "Consider setting a peak-to-peak threshold (e.g. 500 µV) to exclude "
+                "electrode pops and seizure artefacts from the feature matrix."
+            )
+
         epochs = mne.Epochs(
             raw,
             events=events,
@@ -601,6 +612,7 @@ class ECoGProcessor(SignalProcessor):
             baseline=self.epoch_cfg.baseline,
             picks=mne.pick_types(raw.info, ecog=True),
             preload=False,          # ← CRITICAL: no full tensor in RAM
+            reject=reject_threshold,
             reject_by_annotation=True,
             verbose=False,
         )
@@ -1254,7 +1266,6 @@ if __name__ == "__main__":
     UNICORN_PATH = args.unicorn or None   # set to Path("unicorn_session.csv") if available
 
     log.info("BCI Dual-Pipeline — Clinical ECoG Run (Walk.mat)")
-    log.info("Target: Apple M3 · 8 GB unified memory — OOM-safe mode")
     log.info("ECoG path    : %s", ECOG_PATH)
     log.info("Unicorn path : %s", UNICORN_PATH or "<not provided — skipping Unicorn pipeline>")
 
@@ -1312,8 +1323,21 @@ if __name__ == "__main__":
         (UNICORN_DIR / "5/5RAW.csv", 15.0),
         (UNICORN_DIR / "6/6RAW.csv", 15.0),
     ]
-    # Filter to files that actually exist — allows partial runs during dev
-    unicorn_files = [(p, o) for p, o in unicorn_files if Path(p).exists()]
+    # Filter to files that actually exist — allows partial runs during dev,
+    # but any missing file is logged explicitly so incomplete datasets are visible.
+    _expected_unicorn_files = unicorn_files
+    unicorn_files = [(p, o) for p, o in _expected_unicorn_files if Path(p).exists()]
+
+    _missing = [(p, o) for p, o in _expected_unicorn_files if not Path(p).exists()]
+    if _missing:
+        log.warning(
+            "%d of %d expected Unicorn file(s) not found — pipeline will run on "
+            "an INCOMPLETE dataset.  Missing paths:\n%s",
+            len(_missing),
+            len(_expected_unicorn_files),
+            "\n".join(f"    {p}" for p, _ in _missing),
+        )
+
     if not unicorn_files:
         log.warning("No Unicorn CSV files found in %s — skipping Unicorn pipeline.", UNICORN_DIR)
         unicorn_files = None
