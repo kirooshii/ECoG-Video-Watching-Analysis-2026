@@ -6,4 +6,5 @@ Makar Lavrov
 
 
 TO INSTALL REQUIREMENTS:
+
 python -m pip install -r requirements.txt
