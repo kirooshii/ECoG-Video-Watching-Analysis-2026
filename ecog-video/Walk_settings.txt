@@ -1,0 +1,9 @@
+fs: 1200/128
+
+CH1: time
+CH2-161: ECoG 1-160
+CH162: DI (Photodiode Feedback)
+CH163: StimCode
+CH164: GroupId
+
+no reference

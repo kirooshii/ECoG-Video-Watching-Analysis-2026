@@ -1,0 +1,78 @@
+changes:
+filtering first 60 channels over the lobe core
+
+
+15:07:36 [INFO] bci_pipeline – BCI Dual-Pipeline — Clinical ECoG Run (Walk.mat)
+15:07:36 [INFO] bci_pipeline – Target: Apple M3 · 8 GB unified memory — OOM-safe mode
+15:07:36 [INFO] bci_pipeline – ECoG path    : ecog-video/Walk.mat
+15:07:36 [INFO] bci_pipeline – Unicorn path : <not provided — skipping Unicorn pipeline>
+15:07:36 [INFO] bci_pipeline – === ECoG Pipeline ===
+15:07:36 [INFO] bci_pipeline – [ECoGProcessor] Loading: Walk.mat
+15:07:36 [INFO] bci_pipeline –   scipy.io.loadmat('Walk.mat', variable_names=['y']) …
+15:07:36 [INFO] bci_pipeline –   Raw matrix shape: (322049, 164)  dtype: float32
+15:07:36 [INFO] bci_pipeline –   Slicing 100 ROI channels 61–160, Photodiode [161], StimCode [162] …
+15:07:37 [INFO] bci_pipeline –   Original matrix freed.  ROI ECoG array: (100, 322049)  (128.8 MB)
+15:07:37 [INFO] bci_pipeline –   RawArray ready: 160 ECoG ch + Photodiode + StimCode  |  268.4 s @ 1200 Hz
+15:07:37 [INFO] bci_pipeline – [ECoGProcessor] Preprocessing …
+15:07:37 [INFO] bci_pipeline –   Applying notch filters at: [50.0, 100.0, 150.0] Hz
+15:07:38 [INFO] bci_pipeline –   Applying Common Average Reference (CAR) …
+15:07:39 [INFO] bci_pipeline –   Computing High-Gamma (70–150 Hz) envelope …
+15:07:45 [INFO] bci_pipeline – [ECoGProcessor] Extracting epochs …
+15:07:45 [INFO] bci_pipeline –   Photodiode: 126 total rising edges detected
+15:07:45 [INFO] bci_pipeline –   StimCode gate (==2): kept 126 / 126  (dropped 0 outside video)
+15:07:45 [INFO] bci_pipeline –   Using real behavioural labels (126 events, classes: [1, 2, 3])
+15:07:45 [INFO] bci_pipeline –   Event IDs: {'class_1': 1, 'class_2': 2, 'class_3': 3}
+15:07:45 [INFO] bci_pipeline – [ECoGProcessor] Building feature matrix …
+15:07:45 [INFO] bci_pipeline – [ECoGProcessor] Done — X: (126, 100)  y: (126,)
+15:07:45 [INFO] bci_pipeline –   Cross-validating: RandomForest (5 folds) …
+15:07:46 [INFO] bci_pipeline –   Cross-validating: SVM_RBF (5 folds) …
+/Users/kir/Documents/Code/brain/.venv/lib/python3.13/site-packages/sklearn/metrics/_classification.py:1833: UndefinedMetricWarning: Precision is ill-defined and being set to 0.0 in labels with no predicted samples. Use `zero_division` parameter to control this behavior.
+  _warn_prf(average, modifier, f"{metric.capitalize()} is", result.shape[0])
+============================================================
+  ECoG (intracranial) — Classification Results
+============================================================
+
+── RandomForest ──────────────────────────────
+  CV Accuracy : 0.6655 ± 0.0956
+  Precision   : 0.7044
+  Recall      : 0.6586
+  F1 (macro)  : 0.6664
+
+  Classification Report (full-data fit):
+              precision    recall  f1-score   support
+
+       color       1.00      1.00      1.00        56
+       shape       1.00      1.00      1.00        53
+        face       1.00      1.00      1.00        17
+
+    accuracy                           1.00       126
+   macro avg       1.00      1.00      1.00       126
+weighted avg       1.00      1.00      1.00       126
+
+  Confusion Matrix:
+[[56  0  0]
+ [ 0 53  0]
+ [ 0  0 17]]
+
+── SVM_RBF ──────────────────────────────
+  CV Accuracy : 0.6108 ± 0.0488
+  Precision   : 0.6343
+  Recall      : 0.5347
+  F1 (macro)  : 0.5516
+
+  Classification Report (full-data fit):
+              precision    recall  f1-score   support
+
+       color       0.94      0.91      0.93        56
+       shape       0.91      0.94      0.93        53
+        face       1.00      1.00      1.00        17
+
+    accuracy                           0.94       126
+   macro avg       0.95      0.95      0.95       126
+weighted avg       0.94      0.94      0.94       126
+
+  Confusion Matrix:
+[[51  5  0]
+ [ 3 50  0]
+ [ 0  0 17]]
+15:07:47 [INFO] bci_pipeline – Pipeline complete.
