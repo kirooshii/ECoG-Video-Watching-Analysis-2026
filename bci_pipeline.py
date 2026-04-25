@@ -959,7 +959,7 @@ if __name__ == "__main__":
 
     # ── Configuration ─────────────────────────────────────────────────────────
     epoch_cfg = EpochConfig(tmin=-0.2, tmax=1.0, baseline=(-0.2, 0.0), chunk_size=32)
-    ecog_cfg  = ECoGConfig(sfreq_expected=1000.0, notch_freqs=[50.0, 100.0], hg_band=(70.0, 150.0))
+    ecog_cfg  = ECoGConfig(sfreq_expected=1200.0, notch_freqs=[50.0, 100.0], hg_band=(70.0, 150.0))
     uni_cfg   = UnicornConfig(sfreq=250.0, ab_band=(8.0, 30.0), butter_order=4)
 
     label_map = {1: "color", 2: "shape", 3: "face"}
