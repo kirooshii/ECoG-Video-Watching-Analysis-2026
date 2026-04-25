@@ -87,16 +87,39 @@ class EpochConfig:
 
 @dataclass
 class ECoGConfig:
-    """ECoG-specific DSP parameters."""
-    sfreq_expected: float = 1000.0   # Hz — typical clinical ECoG
+    """
+    ECoG-specific DSP parameters — configured for Walk.mat clinical dataset.
+
+    Walk.mat column layout (0-based Python indices):
+      Col  0        : Time vector  → discard, MNE owns the time axis
+      Cols 1–160    : 160 ECoG electrodes  (n_ecog_channels)
+      Col  161      : Photodiode  (binary 0/1, rising edge = stimulus onset)
+      Col  162      : StimCode    (1=pre-paradigm, 2=video playing, 3=post)
+      Col  163      : GroupId     → discard
+    """
+    sfreq_expected:    float = 1200.0   # Hz — Walk.mat acquisition rate
+
+    # ── Column indices (0-based) ───────────────────────────────────────────────────────
+    mat_variable:      str   = "y"      # MATLAB workspace variable to load
+    n_ecog_channels:   int   = 160      # electrode columns start at index 1
+    ecog_col_start:    int   = 1        # first ECoG column (inclusive)
+    ecog_col_stop:     int   = 161      # last  ECoG column (exclusive) → slice [1:161]
+    photodiode_col:    int   = 161      # column index of the photodiode channel
+    stimcode_col:      int   = 162      # column index of the StimCode channel
+    stimcode_video:    int   = 2        # StimCode value meaning "video is playing"
+    photodiode_thresh: float = 0.5      # rising-edge threshold (signal is binary 0/1)
+
+    # ── DSP parameters ───────────────────────────────────────────────────────────────
     notch_freqs: list = field(default_factory=lambda: [50.0, 100.0, 150.0])
-    notch_q: float = 30.0            # Quality factor → BW = f/Q
+    notch_q: float = 30.0               # Quality factor → BW = f/Q (≈1.67 Hz @ 50 Hz)
     hg_band: Tuple[float, float] = (70.0, 150.0)   # High-Gamma passband
-    # FIR filter length for high-gamma: rule of thumb = 3 * (sfreq/low_cutoff)
-    # Here: 3 * (1000/70) ≈ 43 → rounded to next odd = 43 taps (≈43 ms group delay,
-    # but zero-phase after filtfilt so net delay = 0).
-    fir_n_taps: int = 213            # longer → sharper roll-off, higher latency cost
-    trigger_channel: str = "TRIGGER" # name of the event/marker channel in .mat
+
+    # FIR tap count at 1200 Hz for a 70 Hz lower cutoff.
+    # Minimum rule: N ≥ 3 × (sfreq / f_low) = 3 × (1200 / 70) ≈ 52.
+    # We use 257 (a power-of-2 + 1) for a sharp −80 dB Kaiser stopband while
+    # keeping filtfilt edge effects ≤ 257/1200 ≈ 214 ms — well within the
+    # −200 ms pre-stimulus baseline that we discard during baseline correction.
+    fir_n_taps: int = 257
 
 
 @dataclass
@@ -256,59 +279,92 @@ class ECoGProcessor(SignalProcessor):
 
     def load_raw(self, path: Path) -> mne.io.BaseRaw:
         """
-        Ingest a .mat file containing a continuous ECoG recording.
+        Ingest Walk.mat into an MNE RawArray with strict OOM prevention.
 
-        Expected .mat structure (adjust key names to your lab convention):
-          mat['data']    : (n_channels, n_samples) float64
-          mat['sfreq']   : scalar sampling frequency
-          mat['trigger'] : (1, n_samples) integer trigger channel
+        Walk.mat layout  (346 903 samples × 164 columns, float64, ~430 MB on disk):
+          y[:, 0]        — Time vector           → discard
+          y[:, 1:161]    — 160 ECoG electrodes   → ECoG channels
+          y[:, 161]      — Photodiode (0/1)       → STIM channel "Photodiode"
+          y[:, 162]      — StimCode (1/2/3)       → STIM channel "StimCode"
+          y[:, 163]      — GroupId                → discard
 
-        For memory efficiency we use scipy.io with mmap_mode='r' for legacy
-        .mat files.  For HDF5-based v7.3 mats, use h5py with lazy slicing.
+        Memory budget (float32, n_samples=346 903):
+          160 ch ECoG  :  160 × 346 903 × 4 B  ≈  222 MB
+          2  aux rows  :    2 × 346 903 × 4 B  ≈    3 MB
+          Peak (during slice + copy + del original) ≈ 650 MB — safe on 8 GB.
+
+        The critical window is between sio.loadmat() returning the full float64
+        dict (≈430 MB) and the moment we `del mat` — during that window we hold
+        both the float64 original and the float32 copy.  The explicit del+GC
+        below collapses that window to a single statement.
         """
-        suffix = path.suffix.lower()
-        if suffix != ".mat":
-            raise ValueError(f"ECoGProcessor expects a .mat file, got: {suffix}")
+        cfg = self.cfg
+        sfreq = cfg.sfreq_expected
 
-        # scipy.io.loadmat does NOT support mmap_mode for v5 .mat files.
-        # True lazy loading is only available via h5py for v7.3 (HDF5) .mat
-        # files — the h5py branch below handles that case.
-        # For v5 .mat files, we load into float32 immediately and free the
-        # original dict to minimise peak RAM (float32 = half footprint of f64).
-        try:
-            mat = sio.loadmat(str(path))
-            data = mat["data"]       # (n_ch, n_times)
-            sfreq = float(np.squeeze(mat.get("sfreq", self.cfg.sfreq_expected)))
-            trigger_arr = np.squeeze(mat.get(self.cfg.trigger_channel, np.zeros(data.shape[1])))
-        except NotImplementedError:
-            # v7.3 .mat files are HDF5 — scipy.io cannot handle them
-            import h5py  # optional dep; install with: pip install h5py
-            with h5py.File(path, "r") as f:
-                # HDF5 datasets are lazy by default — only sliced on access
-                data = f["data"][:]      # unavoidable full load for MNE compat
-                sfreq = float(np.squeeze(f.get("sfreq", self.cfg.sfreq_expected)))
-                trigger_arr = np.squeeze(f.get(self.cfg.trigger_channel, np.zeros(data.shape[1])))
+        if path.suffix.lower() != ".mat":
+            raise ValueError(f"ECoGProcessor expects a .mat file, got: {path.suffix}")
 
-        # Build channel names: "ECoG001", "ECoG002", …
-        n_ch = data.shape[0]
-        ch_names = [f"ECoG{i+1:03d}" for i in range(n_ch)]
-        ch_types = ["ecog"] * n_ch
+        # ── Step A: Targeted load — only the 'y' variable, nothing else ───────
+        # variable_names= prevents scipy from deserialising every workspace var.
+        # For a 164-column mat this is modest, but good practice for labs that
+        # store multiple large arrays (e.g., pre-processed copies) in one file.
+        log.info("  scipy.io.loadmat('%s', variable_names=['%s']) …", path.name, cfg.mat_variable)
+        mat = sio.loadmat(str(path), variable_names=[cfg.mat_variable])
+        y = mat[cfg.mat_variable]   # (n_samples, 164) float64 — the only allocation
 
-        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
-        # MNE RawArray accepts (n_ch, n_times) — units must be SI (V); ECoG
-        # data is often stored in µV, so scale accordingly.
-        raw = mne.io.RawArray(data.astype(np.float32) * 1e-6, info, verbose=False)
+        log.info("  Raw matrix shape: %s  dtype: %s", y.shape, y.dtype)
+        n_samples = y.shape[0]
 
-        # Attach trigger channel as a stimulus channel so MNE can find events
-        trig_info = mne.create_info(["STI014"], sfreq, ch_types=["stim"])
-        trig_raw = mne.io.RawArray(trigger_arr[np.newaxis, :].astype(np.float32), trig_info, verbose=False)
-        raw.add_channels([trig_raw], force_update_info=True)
+        # ── Step B: Slice and downcast BEFORE freeing y ───────────────────────
+        # We extract the three arrays we need as float32 copies, then immediately
+        # delete y and mat.  Peak RAM = sizeof(y_f64) + sizeof(slices_f32):
+        #   y_f64  : 346903 × 164 × 8 B ≈ 455 MB
+        #   slices : 346903 × 162 × 4 B ≈ 225 MB   → total ≈ 680 MB transient peak
+        # This is acceptable on 8 GB unified memory.
+        log.info("  Slicing ECoG channels [%d:%d], Photodiode [%d], StimCode [%d] …",
+                 cfg.ecog_col_start, cfg.ecog_col_stop,
+                 cfg.photodiode_col, cfg.stimcode_col)
 
-        # preload=False → data stays on disk / mmap, only headers are in RAM
-        # RawArray is always in memory, so we immediately downcast to float32
-        # to halve the footprint vs float64.
-        del mat, data, trigger_arr
+        # Transpose immediately: MNE requires (n_channels, n_samples)
+        ecog_data  = y[:, cfg.ecog_col_start : cfg.ecog_col_stop].T.astype(np.float32)
+        photodiode = y[:, cfg.photodiode_col].astype(np.float32)   # (n_samples,)
+        stimcode   = y[:, cfg.stimcode_col  ].astype(np.float32)   # (n_samples,)
+
+        # ── Step C: CRITICAL — free the 455 MB float64 matrix NOW ────────────
+        del y, mat
         gc.collect()
+        log.info("  Original matrix freed.  ECoG array: %s  (%.1f MB)",
+                 ecog_data.shape, ecog_data.nbytes / 1e6)
+
+        # ── Step D: Build MNE RawArray for ECoG channels ──────────────────────
+        # ECoG data is stored in µV in Walk.mat; convert to SI Volts for MNE.
+        ch_names = [f"ECoG{i+1:03d}" for i in range(cfg.n_ecog_channels)]
+        info = mne.create_info(
+            ch_names=ch_names,
+            sfreq=sfreq,
+            ch_types=["ecog"] * cfg.n_ecog_channels,
+        )
+        raw = mne.io.RawArray(ecog_data * 1e-6, info, verbose=False)
+        del ecog_data
+        gc.collect()
+
+        # ── Step E: Append Photodiode + StimCode as named STIM channels ───────
+        # Naming them explicitly (not "STI014") lets extract_epochs() retrieve
+        # them by name, which is more robust than relying on channel order.
+        aux_data = np.vstack([photodiode[np.newaxis, :], stimcode[np.newaxis, :]])
+        aux_info = mne.create_info(
+            ch_names=["Photodiode", "StimCode"],
+            sfreq=sfreq,
+            ch_types=["stim", "stim"],
+        )
+        aux_raw = mne.io.RawArray(aux_data, aux_info, verbose=False)
+        raw.add_channels([aux_raw], force_update_info=True)
+
+        del photodiode, stimcode, aux_data
+        gc.collect()
+
+        log.info("  RawArray ready: %d ECoG ch + Photodiode + StimCode  |  %.1f s @ %.0f Hz",
+                 cfg.n_ecog_channels, n_samples / sfreq, sfreq)
         return raw
 
     # ── 2b. Preprocessing ─────────────────────────────────────────────────────
@@ -388,34 +444,139 @@ class ECoGProcessor(SignalProcessor):
 
     def extract_epochs(self) -> mne.Epochs:
         """
-        Find events in the STIM channel and segment the continuous signal.
+        Detect photodiode rising edges, gate by StimCode==2, assign labels.
 
-        MNE Epochs with preload=False keeps epoch metadata in RAM but defers
-        data loading until iteration — critical for long ECoG recordings.
+        Why photodiode instead of a digital trigger channel?
+        -------------------------------------------------------
+        Clinical ECoG systems often lack a dedicated TTL input, so experimenters
+        use a photodiode taped to a corner of the stimulus monitor.  The diode
+        voltage transitions 0→1 at the exact frame that the stimulus appears,
+        giving sub-millisecond precision at 1200 Hz (≈0.83 ms per sample).
+
+        Gating by StimCode==2 ("video playing"):
+        ---------------------------------------------------------------
+        The Walk.mat paradigm has three phases:
+          1 = pre-paradigm  (baseline rest, no stimuli)
+          2 = video playing (the condition we care about)
+          3 = post-paradigm (recovery, no stimuli)
+        Photodiode noise or screen refresh artefacts may fire spurious rising
+        edges during phases 1 and 3.  The StimCode gate cleanly rejects these
+        without any amplitude thresholding on the neural channels.
+
+        Label assignment (placeholder — TODO for real data):
+        ---------------------------------------------------------------
+        Walk.mat does not embed per-trial category labels in the matrix itself.
+        Labels must come from a separate behavioural log (e.g., a .csv that
+        records which colour/shape/face was shown for each photodiode flash).
+        Until that log is provided, we cycle through [1, 2, 3] sequentially.
+        Replace the mock_labels line with your actual label vector.
         """
-        events = mne.find_events(
-            self._raw,
-            stim_channel="STI014",
-            verbose=False,
+        cfg = self.cfg
+        raw = self._raw
+
+        # ── 1. Pull Photodiode and StimCode arrays into RAM ───────────────────
+        # raw[channel_name, :] returns (1, T); squeeze to (T,).
+        # These are small (346 903 × 4 B ≈ 1.4 MB each) — safe to load fully.
+        photodiode = raw["Photodiode"][0][0]   # (T,) float32
+        stimcode   = raw["StimCode"  ][0][0]   # (T,) float32
+
+        # ── 2. Detect rising edges on the Photodiode channel ──────────────────
+        # A rising edge occurs where the signal crosses from below to above
+        # the threshold.  We diff on a boolean array to avoid floating-point
+        # precision issues with the 0/1 signal.
+        #
+        # Derivation:
+        #   is_high[t]  = photodiode[t] >= thresh        → boolean mask
+        #   rising[t]   = is_high[t] AND NOT is_high[t-1]
+        #   Sample index of the rising edge = t (the first HIGH sample).
+        #   We add +1 because is_high[1:] corresponds to original index 1..T-1.
+        thresh   = cfg.photodiode_thresh
+        is_high  = photodiode >= thresh                     # (T,) bool
+        rising   = is_high[1:] & ~is_high[:-1]             # (T-1,) bool
+        all_rising_samples = np.where(rising)[0] + 1       # 1-based correction
+
+        log.info("  Photodiode: %d total rising edges detected", len(all_rising_samples))
+
+        # ── 3. Gate: keep only events where StimCode == 2 ─────────────────────
+        # Index into stimcode at the exact rising-edge sample to check the
+        # paradigm phase at that moment.  Cast to int for exact equality.
+        stim_at_onset = stimcode[all_rising_samples].astype(np.int32)
+        video_mask    = stim_at_onset == cfg.stimcode_video
+        valid_samples = all_rising_samples[video_mask]
+
+        n_total = len(all_rising_samples)
+        n_valid = len(valid_samples)
+        n_dropped = n_total - n_valid
+        log.info("  StimCode gate (==2): kept %d / %d  (dropped %d outside video)",
+                 n_valid, n_total, n_dropped)
+
+        del photodiode, stimcode, is_high, rising, all_rising_samples
+        gc.collect()
+
+        if n_valid == 0:
+            raise ValueError(
+                "No photodiode events found during StimCode==2 (video playing). "
+                "Check that the Photodiode column index and threshold are correct, "
+                f"and that StimCode value {cfg.stimcode_video} is present in the data."
+            )
+
+        # ── 4. Assign stimulus category labels ────────────────────────────────
+        #
+        # TODO: Replace `mock_labels` with your real per-trial label array.
+        #
+        # Your label array must be shape (n_valid,) with integer codes, e.g.:
+        #   1 = color stimulus
+        #   2 = shape stimulus
+        #   3 = face  stimulus
+        #
+        # Typical workflow:
+        #   behav_log   = pd.read_csv("walk_behavioural_log.csv")
+        #   # The log should have one row per photodiode flash during the video.
+        #   # Align by trial index (assumes log rows correspond 1:1 to valid events):
+        #   real_labels = behav_log["category_code"].values.astype(np.int32)
+        #   assert len(real_labels) == n_valid, "Log/event count mismatch!"
+        #
+        # Then replace the next line:
+        #   labels = real_labels
+        #
+        mock_labels = ((np.arange(n_valid) % 3) + 1).astype(np.int32)
+        labels = mock_labels  # ← TODO: swap with real_labels from behavioural log
+
+        log.warning(
+            "  [TODO] Using sequential mock labels (1→2→3 cycling) for %d events. "
+            "Inject real behavioural label array before any production analysis.",
+            n_valid,
         )
-        if events.shape[0] == 0:
-            raise ValueError("No events found in STI014 — check trigger channel encoding.")
 
-        # event_id maps descriptive label → integer code stored in events[:,2]
-        # Adapt to your actual trigger codes; here we use whatever codes are present.
-        unique_codes = np.unique(events[:, 2])
-        event_id = {f"stim_{c}": int(c) for c in unique_codes}
-        log.info("  Found events: %s", event_id)
+        # ── 5. Build the MNE events array: shape (n_events, 3) ───────────────
+        # MNE convention: col0=sample_index, col1=prev_event_id (0), col2=event_id
+        events = np.column_stack([
+            valid_samples.astype(np.int32),
+            np.zeros(n_valid, dtype=np.int32),   # always 0 (MNE convention)
+            labels,
+        ])
 
+        # ── 6. Map integer codes to human-readable names ──────────────────────
+        unique_codes = np.unique(labels)
+        # These names are placeholders — update once real labels are injected.
+        # TODO: Replace with your actual class name mapping once real labels are used.
+        placeholder_names = {1: "class_1", 2: "class_2", 3: "class_3"}
+        event_id = {placeholder_names.get(c, f"stim_{c}"): int(c) for c in unique_codes}
+        log.info("  Event IDs: %s", event_id)
+
+        # ── 7. Epoch around each event ────────────────────────────────────────
+        # preload=False: MNE stores only the event table in RAM; the (n_epochs ×
+        # 160 ch × 1441 samples) tensor (~800 MB at float32) is NEVER materialised
+        # — it is streamed in chunks inside _build_features().
         epochs = mne.Epochs(
-            self._raw,
+            raw,
             events=events,
             event_id=event_id,
             tmin=self.epoch_cfg.tmin,
             tmax=self.epoch_cfg.tmax,
             baseline=self.epoch_cfg.baseline,
-            picks=mne.pick_types(self._raw.info, ecog=True),
-            preload=False,    # ← CRITICAL: no full tensor in RAM
+            picks=mne.pick_types(raw.info, ecog=True),
+            preload=False,          # ← CRITICAL: no full tensor in RAM
             reject_by_annotation=True,
             verbose=False,
         )
@@ -826,170 +987,114 @@ class BCIExperiment:
 
 
 # =============================================================================
-# 6. Synthetic data generator — validates the pipeline without real hardware
-# =============================================================================
-
-def generate_synthetic_ecog_mat(
-    path: Path,
-    n_channels: int = 64,
-    duration_s: float = 300.0,
-    sfreq: float = 1000.0,
-    n_classes: int = 3,
-    n_trials_per_class: int = 40,
-) -> Path:
-    """
-    Write a synthetic .mat file that mimics a minimal ECoG recording.
-
-    The synthetic signal contains:
-      • Pink noise (1/f) as background ECoG baseline
-      • Class-specific high-gamma bursts (70–150 Hz) at trial onsets
-      • A TRIGGER channel with integer codes 1, 2, 3 at trial onsets
-
-    This lets you validate the full pipeline end-to-end on a laptop with no
-    ECoG hardware.
-    """
-    rng = np.random.default_rng(seed=0)
-    n_samples = int(duration_s * sfreq)
-
-    # 1/f noise: FFT-based generation (memory-efficient for large arrays)
-    def pink_noise(n: int, n_ch: int) -> np.ndarray:
-        f = np.fft.rfftfreq(n)[1:]                   # skip DC
-        power = (1.0 / f) ** 0.5
-        phases = rng.uniform(0, 2 * np.pi, (n_ch, len(f)))
-        spectrum = power * np.exp(1j * phases)
-        full_spectrum = np.zeros((n_ch, n // 2 + 1), dtype=complex)
-        full_spectrum[:, 1:] = spectrum
-        return np.fft.irfft(full_spectrum, n=n).astype(np.float32) * 50  # µV scale
-
-    data = pink_noise(n_samples, n_channels)
-
-    # Inject class-discriminating HG bursts
-    trigger = np.zeros(n_samples, dtype=np.float32)
-    onset_gap = int(sfreq * (duration_s / (n_classes * n_trials_per_class + 5)))
-    onset = int(sfreq * 2.0)   # start 2 s in
-
-    for cls in range(1, n_classes + 1):
-        for _ in range(n_trials_per_class):
-            if onset + int(sfreq * 1.2) >= n_samples:
-                break
-            t_burst = np.arange(int(sfreq * 0.5)) / sfreq
-            # Different channels respond to different classes (spatial specificity)
-            active_chs = slice((cls - 1) * 10, cls * 10)
-            burst = (np.sin(2 * np.pi * (80 + cls * 20) * t_burst) * 20).astype(np.float32)
-            data[active_chs, onset: onset + len(burst)] += burst[np.newaxis, :]
-            trigger[onset] = float(cls)
-            onset += onset_gap
-
-    mat_dict = {
-        "data": data,           # (n_ch, n_samples) µV
-        "sfreq": np.array([[sfreq]]),
-        "TRIGGER": trigger[np.newaxis, :],
-    }
-    sio.savemat(str(path), mat_dict)
-    log.info("Synthetic ECoG .mat written: %s  (%d ch × %.0f s)", path, n_channels, duration_s)
-    del data, trigger
-    gc.collect()
-    return path
-
-
-def generate_synthetic_unicorn_csv(
-    path: Path,
-    duration_s: float = 300.0,
-    sfreq: float = 250.0,
-    n_classes: int = 3,
-    n_trials_per_class: int = 40,
-) -> Path:
-    """
-    Write a synthetic Unicorn-format CSV with 8 EEG channels + Trigger column.
-
-    Alpha/Beta oscillations (8–30 Hz) are injected class-specifically — 
-    mimicking SSVEP or motor-imagery alpha-band modulation.
-    """
-    rng = np.random.default_rng(seed=1)
-    n_samples = int(duration_s * sfreq)
-    ch_names = ["Fz", "C3", "Cz", "C4", "Pz", "PO7", "Oz", "PO8"]
-    t = np.arange(n_samples) / sfreq
-
-    # Background: white + some alpha
-    data = (rng.standard_normal((8, n_samples)) * 5).astype(np.float32)   # µV
-    data += (10 * np.sin(2 * np.pi * 10 * t)).astype(np.float32)          # 10 Hz alpha
-
-    trigger = np.zeros(n_samples, dtype=np.float32)
-    onset_gap = int(sfreq * (duration_s / (n_classes * n_trials_per_class + 5)))
-    onset = int(sfreq * 2.0)
-
-    for cls in range(1, n_classes + 1):
-        for _ in range(n_trials_per_class):
-            if onset + int(sfreq * 1.2) >= n_samples:
-                break
-            t_stim = np.arange(int(sfreq * 1.0)) / sfreq
-            freq = 10.0 + cls * 5.0   # class 1→15 Hz, 2→20 Hz, 3→25 Hz
-            active = cls - 1          # different channel per class
-            data[active, onset: onset + len(t_stim)] += (15 * np.sin(2 * np.pi * freq * t_stim)).astype(np.float32)
-            trigger[onset] = float(cls)
-            onset += onset_gap
-
-    # Build CSV: header + rows
-    header = ch_names + ["Trigger"]
-    csv_data = np.vstack([data, trigger[np.newaxis, :]]).T  # (n_samples, 9)
-    np.savetxt(
-        str(path),
-        csv_data,
-        delimiter=",",
-        header=",".join(header),
-        comments="",
-        fmt="%.6f",
-    )
-    log.info("Synthetic Unicorn CSV written: %s  (8 ch × %.0f s)", path, duration_s)
-    del data, trigger, csv_data
-    gc.collect()
-    return path
-
-
-# =============================================================================
-# 7. Entry point
+# 6. Entry point
 # =============================================================================
 
 if __name__ == "__main__":
-    import tempfile
+    import argparse
     from pathlib import Path
 
-    log.info("BCI Dual-Pipeline — Synthetic Validation Run")
+    # ── CLI — accept paths as arguments or fall back to hardcoded defaults ────
+    parser = argparse.ArgumentParser(
+        description="BCI Dual-Pipeline: ECoG (Walk.mat) vs Unicorn EEG"
+    )
+    parser.add_argument(
+        "--ecog",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to Walk.mat  (required for ECoG pipeline)",
+    )
+    parser.add_argument(
+        "--unicorn",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to Unicorn CSV  (optional; skip Unicorn pipeline if absent)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=16,
+        metavar="N",
+        help="Epochs per RAM chunk during feature extraction (default: 16). "
+             "Lower this if you hit OOM on 8 GB with 160-channel ECoG.",
+    )
+    parser.add_argument(
+        "--cv-splits",
+        type=int,
+        default=5,
+        help="Number of StratifiedKFold folds (default: 5)",
+    )
+    args = parser.parse_args()
+
+    # ── Hardcoded fallback paths — edit these for your local environment ──────
+    # These are used only when the script is run without CLI arguments, e.g.
+    # from an IDE or Jupyter %run magic.
+    ECOG_PATH    = args.ecog    or Path("Walk.mat")
+    UNICORN_PATH = args.unicorn or None   # set to Path("unicorn_session.csv") if available
+
+    log.info("BCI Dual-Pipeline — Clinical ECoG Run (Walk.mat)")
     log.info("Target: Apple M3 · 8 GB unified memory — OOM-safe mode")
+    log.info("ECoG path    : %s", ECOG_PATH)
+    log.info("Unicorn path : %s", UNICORN_PATH or "<not provided — skipping Unicorn pipeline>")
+
+    if not ECOG_PATH.exists():
+        raise FileNotFoundError(
+            f"Walk.mat not found at: {ECOG_PATH.resolve()}\n"
+            "Pass the correct path with: python bci_pipeline.py --ecog /path/to/Walk.mat"
+        )
 
     # ── Configuration ─────────────────────────────────────────────────────────
-    epoch_cfg = EpochConfig(tmin=-0.2, tmax=1.0, baseline=(-0.2, 0.0), chunk_size=32)
-    ecog_cfg  = ECoGConfig(sfreq_expected=1200.0, notch_freqs=[50.0, 100.0], hg_band=(70.0, 150.0))
-    uni_cfg   = UnicornConfig(sfreq=250.0, ab_band=(8.0, 30.0), butter_order=4)
+    epoch_cfg = EpochConfig(
+        tmin=-0.2,
+        tmax=1.0,
+        baseline=(-0.2, 0.0),
+        # chunk_size=16 → each chunk = 16 epochs × 160 ch × 1441 samples × 4 B ≈ 148 MB
+        # Increase to 32 if RAM allows; decrease to 8 if you hit OOM.
+        chunk_size=args.chunk_size,
+    )
 
-    label_map = {1: "color", 2: "shape", 3: "face"}
+    ecog_cfg = ECoGConfig(
+        # All defaults match Walk.mat spec; override here if your file differs.
+        sfreq_expected    = 1200.0,
+        mat_variable      = "y",
+        n_ecog_channels   = 160,
+        ecog_col_start    = 1,
+        ecog_col_stop     = 161,
+        photodiode_col    = 161,
+        stimcode_col      = 162,
+        stimcode_video    = 2,
+        photodiode_thresh = 0.5,
+        notch_freqs       = [50.0, 100.0, 150.0],
+        notch_q           = 30.0,
+        hg_band           = (70.0, 150.0),
+        fir_n_taps        = 257,
+    )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        ecog_path   = tmpdir / "ecog_synthetic.mat"
-        unicorn_path = tmpdir / "unicorn_synthetic.csv"
+    uni_cfg = UnicornConfig(
+        sfreq        = 250.0,
+        ab_band      = (8.0, 30.0),
+        butter_order = 4,
+    )
 
-        # Generate synthetic data (mimics real recordings structurally)
-        generate_synthetic_ecog_mat(
-            ecog_path, n_channels=64, duration_s=120.0,
-            n_classes=3, n_trials_per_class=30,
-        )
-        generate_synthetic_unicorn_csv(
-            unicorn_path, duration_s=120.0,
-            n_classes=3, n_trials_per_class=30,
-        )
+    # ── Label map (placeholder — update once real labels are injected) ─────────
+    # TODO: Replace with your actual stimulus category mapping once the
+    #       behavioural log is wired into extract_epochs().
+    label_map = {1: "class_1", 2: "class_2", 3: "class_3"}
 
-        # ── Run experiment ────────────────────────────────────────────────────
-        experiment = BCIExperiment(
-            epoch_cfg=epoch_cfg,
-            ecog_cfg=ecog_cfg,
-            unicorn_cfg=uni_cfg,
-            n_cv_splits=5,
-        )
-        results = experiment.run(
-            ecog_mat_path=ecog_path,
-            unicorn_csv_path=unicorn_path,
-            label_map=label_map,
-        )
+    # ── Run experiment ────────────────────────────────────────────────────────
+    experiment = BCIExperiment(
+        epoch_cfg  = epoch_cfg,
+        ecog_cfg   = ecog_cfg,
+        unicorn_cfg = uni_cfg,
+        n_cv_splits = args.cv_splits,
+    )
 
-    log.info("Pipeline complete. All temp files cleaned up.")
+    results = experiment.run(
+        ecog_mat_path    = ECOG_PATH,
+        unicorn_csv_path = UNICORN_PATH,
+        label_map        = label_map,
+    )
+
+    log.info("Pipeline complete.")
