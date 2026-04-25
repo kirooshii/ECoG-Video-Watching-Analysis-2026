@@ -99,26 +99,26 @@ class ECoGConfig:
     """
     sfreq_expected:    float = 1200.0   # Hz — Walk.mat acquisition rate
 
-    # ── Column indices (0-based) ───────────────────────────────────────────────────────
-    mat_variable:      str   = "y"      # MATLAB workspace variable to load
-    n_ecog_channels:   int   = 160      # electrode columns start at index 1
-    ecog_col_start:    int   = 1        # first ECoG column (inclusive)
-    ecog_col_stop:     int   = 161      # last  ECoG column (exclusive) → slice [1:161]
-    photodiode_col:    int   = 161      # column index of the photodiode channel
-    stimcode_col:      int   = 162      # column index of the StimCode channel
-    stimcode_video:    int   = 2        # StimCode value meaning "video is playing"
-    photodiode_thresh: float = 0.5      # rising-edge threshold (signal is binary 0/1)
+    # ── Column indices (0-based) ──────────────────────────────────────────────
+    mat_variable:      str   = "y"
+    n_ecog_channels:   int   = 160      # total electrodes in file (do not change)
+    ecog_col_start:    int   = 1        # kept for reference; ROI slicing overrides
+    ecog_col_stop:     int   = 161
+    photodiode_col:    int   = 161
+    stimcode_col:      int   = 162
+    stimcode_video:    int   = 2
+    photodiode_thresh: float = 0.5
 
-    # ── DSP parameters ───────────────────────────────────────────────────────────────
+    # ── ROI: visual / temporal / occipital channels (1-based, from electrode map)
+    # Channels 1–60   → dense frontal/motor grid            → EXCLUDED
+    # Channels 61–100 → posterior temporal, lateral occipital (lateral view) → included
+    # Channels 101–160→ inferior temporal, fusiform, ventral occipital       → included
+    roi_channels: list = field(default_factory=lambda: list(range(61, 161)))
+
+    # ── DSP parameters ────────────────────────────────────────────────────────
     notch_freqs: list = field(default_factory=lambda: [50.0, 100.0, 150.0])
-    notch_q: float = 30.0               # Quality factor → BW = f/Q (≈1.67 Hz @ 50 Hz)
-    hg_band: Tuple[float, float] = (70.0, 150.0)   # High-Gamma passband
-
-    # FIR tap count at 1200 Hz for a 70 Hz lower cutoff.
-    # Minimum rule: N ≥ 3 × (sfreq / f_low) = 3 × (1200 / 70) ≈ 52.
-    # We use 257 (a power-of-2 + 1) for a sharp −80 dB Kaiser stopband while
-    # keeping filtfilt edge effects ≤ 257/1200 ≈ 214 ms — well within the
-    # −200 ms pre-stimulus baseline that we discard during baseline correction.
+    notch_q: float = 30.0
+    hg_band: Tuple[float, float] = (70.0, 150.0)
     fir_n_taps: int = 257
 
 
@@ -310,39 +310,42 @@ class ECoGProcessor(SignalProcessor):
         # store multiple large arrays (e.g., pre-processed copies) in one file.
         log.info("  scipy.io.loadmat('%s', variable_names=['%s']) …", path.name, cfg.mat_variable)
         mat = sio.loadmat(str(path), variable_names=[cfg.mat_variable])
-        y = mat[cfg.mat_variable]   # (n_samples, 164) float64 — the only allocation
+        y = mat[cfg.mat_variable]
+        
+        # scipy loads it that way too, but the rest of the code expects (n_samples, 164)
+        if y.ndim == 2 and y.shape[0] < y.shape[1]:
+            y = y.T
 
         log.info("  Raw matrix shape: %s  dtype: %s", y.shape, y.dtype)
         n_samples = y.shape[0]
 
-        # ── Step B: Slice and downcast BEFORE freeing y ───────────────────────
-        # We extract the three arrays we need as float32 copies, then immediately
-        # delete y and mat.  Peak RAM = sizeof(y_f64) + sizeof(slices_f32):
-        #   y_f64  : 346903 × 164 × 8 B ≈ 455 MB
-        #   slices : 346903 × 162 × 4 B ≈ 225 MB   → total ≈ 680 MB transient peak
-        # This is acceptable on 8 GB unified memory.
-        log.info("  Slicing ECoG channels [%d:%d], Photodiode [%d], StimCode [%d] …",
-                 cfg.ecog_col_start, cfg.ecog_col_stop,
+        # ── Step B: Slice ROI channels and downcast BEFORE freeing y ──────────
+        # roi_channels are 1-based electrode numbers; in the y matrix col 0 is
+        # the time vector, so channel N sits at column index N — no offset needed.
+        roi_cols = cfg.roi_channels                          # e.g. [61, 62, …, 160]
+        n_roi    = len(roi_cols)
+
+        log.info("  Slicing %d ROI channels %d–%d, Photodiode [%d], StimCode [%d] …",
+                 n_roi, roi_cols[0], roi_cols[-1],
                  cfg.photodiode_col, cfg.stimcode_col)
 
-        # Transpose immediately: MNE requires (n_channels, n_samples)
-        ecog_data  = y[:, cfg.ecog_col_start : cfg.ecog_col_stop].T.astype(np.float32)
-        photodiode = y[:, cfg.photodiode_col].astype(np.float32)   # (n_samples,)
-        stimcode   = y[:, cfg.stimcode_col  ].astype(np.float32)   # (n_samples,)
+        # Advanced index → contiguous copy → transpose to (n_roi, n_samples)
+        ecog_data  = y[:, roi_cols].T.astype(np.float32)    # (n_roi, n_samples)
+        photodiode = y[:, cfg.photodiode_col].astype(np.float32)
+        stimcode   = y[:, cfg.stimcode_col  ].astype(np.float32)
 
-        # ── Step C: CRITICAL — free the 455 MB float64 matrix NOW ────────────
+        # ── Step C: CRITICAL — free the full float64 matrix NOW ───────────────
         del y, mat
         gc.collect()
-        log.info("  Original matrix freed.  ECoG array: %s  (%.1f MB)",
+        log.info("  Original matrix freed.  ROI ECoG array: %s  (%.1f MB)",
                  ecog_data.shape, ecog_data.nbytes / 1e6)
 
-        # ── Step D: Build MNE RawArray for ECoG channels ──────────────────────
-        # ECoG data is stored in µV in Walk.mat; convert to SI Volts for MNE.
-        ch_names = [f"ECoG{i+1:03d}" for i in range(cfg.n_ecog_channels)]
+        # ── Step D: Build MNE RawArray for ROI channels only ──────────────────
+        ch_names = [f"ECoG{ch:03d}" for ch in roi_cols]     # e.g. ECoG061…ECoG160
         info = mne.create_info(
             ch_names=ch_names,
             sfreq=sfreq,
-            ch_types=["ecog"] * cfg.n_ecog_channels,
+            ch_types=["ecog"] * n_roi,
         )
         raw = mne.io.RawArray(ecog_data * 1e-6, info, verbose=False)
         del ecog_data
@@ -469,7 +472,6 @@ class ECoGProcessor(SignalProcessor):
         Labels must come from a separate behavioural log (e.g., a .csv that
         records which colour/shape/face was shown for each photodiode flash).
         Until that log is provided, we cycle through [1, 2, 3] sequentially.
-        Replace the mock_labels line with your actual label vector.
         """
         cfg = self.cfg
         raw = self._raw
@@ -535,19 +537,26 @@ class ECoGProcessor(SignalProcessor):
         #   # Align by trial index (assumes log rows correspond 1:1 to valid events):
         #   real_labels = behav_log["category_code"].values.astype(np.int32)
         #   assert len(real_labels) == n_valid, "Log/event count mismatch!"
-        #
-        # Then replace the next line:
-        #   labels = real_labels
-        #
-        mock_labels = ((np.arange(n_valid) % 3) + 1).astype(np.int32)
-        labels = mock_labels  # ← TODO: swap with real_labels from behavioural log
 
-        log.warning(
-            "  [TODO] Using sequential mock labels (1→2→3 cycling) for %d events. "
-            "Inject real behavioural label array before any production analysis.",
-            n_valid,
-        )
+        real_labels = np.array([
+            1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 2, 2, 2, 2, 1, 2, 2, 1, 1, 1,
+            3, 3, 3, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1, 1,
+            2, 2, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1,
+            1, 1, 2, 2, 3, 3, 3, 1, 1, 1, 1, 3, 3, 3, 1, 1, 2, 2, 3, 3, 1, 1, 1, 2,
+            2, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2,
+            2, 2, 3, 3, 3, 3,
+        ], dtype=np.int32)
 
+        if len(real_labels) != n_valid:
+            raise ValueError(
+                f"Label count mismatch: you provided {len(real_labels)} labels "
+                f"but {n_valid} valid photodiode events were detected. "
+                "Check the StimCode gate or your label list."
+            )
+        labels = real_labels
+        log.info("  Using real behavioural labels (%d events, classes: %s)",
+                 n_valid, np.unique(labels).tolist())
+      
         # ── 5. Build the MNE events array: shape (n_events, 3) ───────────────
         # MNE convention: col0=sample_index, col1=prev_event_id (0), col2=event_id
         events = np.column_stack([
@@ -814,8 +823,9 @@ class BCIClassifier:
                 ("scaler", StandardScaler()),
                 ("clf", RandomForestClassifier(
                     n_estimators=200,
-                    max_depth=None,         # grow fully — pruned by min_samples_leaf
+                    max_depth=None,
                     min_samples_leaf=2,
+                    class_weight="balanced",   # ← compensates 56/53/17 imbalance
                     n_jobs=self.n_jobs,
                     random_state=self.random_state,
                 )),
@@ -825,10 +835,10 @@ class BCIClassifier:
                 ("clf", SVC(
                     kernel="rbf",
                     C=1.0,
-                    gamma="scale",          # γ = 1/(n_features * X.var())
-                    class_weight="balanced",
+                    gamma="scale",
+                    class_weight="balanced",   # ← already present, kept
                     random_state=self.random_state,
-                    decision_function_shape="ovr",   # one-vs-rest multiclass
+                    decision_function_shape="ovr",
                 )),
             ]),
         }
@@ -1031,7 +1041,7 @@ if __name__ == "__main__":
     # ── Hardcoded fallback paths — edit these for your local environment ──────
     # These are used only when the script is run without CLI arguments, e.g.
     # from an IDE or Jupyter %run magic.
-    ECOG_PATH    = args.ecog    or Path("Walk.mat")
+    ECOG_PATH    = args.ecog    or Path("ecog-video/Walk.mat")
     UNICORN_PATH = args.unicorn or None   # set to Path("unicorn_session.csv") if available
 
     log.info("BCI Dual-Pipeline — Clinical ECoG Run (Walk.mat)")
@@ -1081,7 +1091,7 @@ if __name__ == "__main__":
     # ── Label map (placeholder — update once real labels are injected) ─────────
     # TODO: Replace with your actual stimulus category mapping once the
     #       behavioural log is wired into extract_epochs().
-    label_map = {1: "class_1", 2: "class_2", 3: "class_3"}
+    label_map = {1: "color", 2: "shape", 3: "face"}
 
     # ── Run experiment ────────────────────────────────────────────────────────
     experiment = BCIExperiment(
