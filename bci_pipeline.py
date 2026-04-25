@@ -184,9 +184,12 @@ class SignalProcessor(abc.ABC):
         Returns
         -------
         X : np.ndarray, shape (n_epochs, n_channels)
-            Mean band-power per epoch per channel — the feature matrix.
         y : np.ndarray, shape (n_epochs,)
-            Integer-encoded class labels.
+
+        Side-effect
+        -----------
+        Sets ``self.ecog_flash_seconds`` — absolute flash onset times in seconds
+        at 1200 Hz resolution, used to synchronise the Unicorn multi-file pipeline.
         """
         log.info("[%s] Loading: %s", self.__class__.__name__, path.name)
         self._raw = self.load_raw(path)
@@ -197,10 +200,22 @@ class SignalProcessor(abc.ABC):
         log.info("[%s] Extracting epochs …", self.__class__.__name__)
         epochs = self.extract_epochs()
 
+        # ── Expose flash times for cross-modality sync ────────────────────────
+        # epochs.events[:, 0] = sample index at 1200 Hz → divide by sfreq
+        self.ecog_flash_seconds: np.ndarray = (
+            epochs.events[:, 0].astype(np.float64) / self.cfg.sfreq_expected
+        )
+        log.info(
+            "[%s] Flash times stored: %d events, %.2f – %.2f s",
+            self.__class__.__name__,
+            len(self.ecog_flash_seconds),
+            self.ecog_flash_seconds[0],
+            self.ecog_flash_seconds[-1],
+        )
+
         log.info("[%s] Building feature matrix …", self.__class__.__name__)
         X, y = self._build_features(epochs)
 
-        # Explicit cleanup — frees the memory-mapped file descriptors
         del epochs
         del self._raw
         self._raw = None
@@ -600,16 +615,13 @@ class UnicornProcessor(SignalProcessor):
     """
     Preprocessing pipeline for 8-channel consumer EEG (Unicorn Hybrid Black).
 
-    Data may come from:
-      (a) Unicorn Suite CSV export  — ``load_from_csv()``
-      (b) Lab Streaming Layer (LSL) — ``load_from_lsl()``
+    Single-file mode  : ``run(path)``                — legacy, kept for compat
+    Multi-file mode   : ``run_multi_file(files, ...)`` — used for the 6-CSV experiment
 
-    The processor auto-detects based on file extension.
+    Pipeline order (per file):
+      load → bandpass (Alpha+Beta: 8–30 Hz) → epoch from ECoG flash times → features
 
-    Pipeline order:
-      load → bandpass (Alpha+Beta: 8–30 Hz) → epoch
-    No CAR: with only 8 channels CAR would over-suppress genuine signals and
-    introduce strong spatial cross-talk between channels.
+    No CAR: with only 8 channels, CAR over-suppresses genuine signals.
     """
 
     def __init__(self, epoch_cfg: EpochConfig, unicorn_cfg: UnicornConfig):
@@ -625,16 +637,16 @@ class UnicornProcessor(SignalProcessor):
         elif suffix in (".xdf", ".lsl"):
             return self._load_lsl(path)
         else:
-            raise ValueError(f"UnicornProcessor: unsupported format '{suffix}'. Use .csv or .xdf")
+            raise ValueError(
+                f"UnicornProcessor: unsupported format '{suffix}'. Use .csv or .xdf"
+            )
 
     def _load_csv(self, path: Path) -> mne.io.BaseRaw:
         """
         Parse a Unicorn Suite CSV export.
         Expected columns: channel names as header, last column = Trigger.
-        Unicorn exports µV-scaled EEG; we convert to Volts for MNE.
-
-        We read with numpy's genfromtxt using a generator to avoid loading the
-        entire CSV into RAM at once — important for multi-hour recordings.
+        Unicorn exports µV-scaled EEG; converted to Volts for MNE.
+        numpy.loadtxt is C-backed and streams from disk — modest RAM usage.
         """
         import csv
 
@@ -643,74 +655,64 @@ class UnicornProcessor(SignalProcessor):
             reader = csv.reader(f)
             header = next(reader)
 
-        # Identify EEG columns (all except trigger)
-        eeg_cols = [h for h in header if h.strip() not in (self.cfg.trigger_column, "")]
-        trig_col_idx = header.index(self.cfg.trigger_column) if self.cfg.trigger_column in header else -1
+        eeg_cols    = [h for h in header if h.strip() not in (self.cfg.trigger_column, "")]
+        trig_col_idx = (
+            header.index(self.cfg.trigger_column)
+            if self.cfg.trigger_column in header
+            else -1
+        )
 
-        # numpy.loadtxt is C-backed and streams from disk → modest RAM usage
         log.info("  Loading CSV data (streaming via numpy) …")
         raw_csv = np.loadtxt(
-            path,
-            delimiter=",",
-            skiprows=1,
-            dtype=np.float32,   # float32 halves memory vs float64
+            path, delimiter=",", skiprows=1, dtype=np.float32
         )   # (n_samples, n_cols)
 
         eeg_indices = [header.index(c) for c in eeg_cols]
-        eeg_data = raw_csv[:, eeg_indices].T * 1e-6   # (n_ch, T), µV → V
-
-        # Build MNE info
-        ch_names = self.cfg.channel_names[: len(eeg_cols)]
-        info = mne.create_info(
-            ch_names=ch_names,
-            sfreq=self.cfg.sfreq,
-            ch_types=["eeg"] * len(ch_names),
+        n_ch     = len(self.cfg.channel_names)         # 8 — the channels we actually want
+        eeg_data = raw_csv[:, eeg_indices[:n_ch]].T * 1e-6   # (8, T) — drop the 9th column
+        log.info(
+            "  CSV has %d non-trigger columns; using first %d as EEG (%s …)",
+            len(eeg_indices), n_ch, eeg_cols[n_ch - 1],
         )
 
+
+        ch_names = self.cfg.channel_names[: len(eeg_cols)]
+        info = mne.create_info(
+            ch_names=ch_names, sfreq=self.cfg.sfreq, ch_types=["eeg"] * len(ch_names)
+        )
         raw = mne.io.RawArray(eeg_data.astype(np.float32), info, verbose=False)
-        # Mark as average-referenced after creation (set_eeg_reference needs a Raw instance)
         raw.set_eeg_reference(ref_channels="average", projection=False, verbose=False)
 
-        # Add trigger channel if present
         if trig_col_idx != -1:
             trig_data = raw_csv[:, trig_col_idx][np.newaxis, :].astype(np.float32)
             trig_info = mne.create_info(["STI014"], self.cfg.sfreq, ch_types=["stim"])
-            trig_raw = mne.io.RawArray(trig_data, trig_info, verbose=False)
-            raw.add_channels([trig_raw], force_update_info=True)
+            raw.add_channels(
+                [mne.io.RawArray(trig_data, trig_info, verbose=False)],
+                force_update_info=True,
+            )
 
         del raw_csv, eeg_data
         gc.collect()
         return raw
 
     def _load_lsl(self, path: Path) -> mne.io.BaseRaw:
-        """
-        Load an XDF file recorded via Lab Streaming Layer.
-        Requires: pip install pyxdf mne
-        """
+        """Load an XDF file recorded via Lab Streaming Layer."""
         try:
             import pyxdf
         except ImportError as exc:
             raise ImportError("Install pyxdf: pip install pyxdf") from exc
 
-        # pyxdf.load_xdf streams per-chunk — the data list is still fully
-        # loaded after this call, but XDF files are typically short BCI sessions.
         streams, _ = pyxdf.load_xdf(str(path))
-
-        # Heuristic: find the stream with 8 channels at ~250 Hz
         eeg_stream = next(
-            (s for s in streams if int(s["info"]["channel_count"][0]) == 8),
-            None,
+            (s for s in streams if int(s["info"]["channel_count"][0]) == 8), None
         )
         if eeg_stream is None:
             raise ValueError("No 8-channel EEG stream found in XDF file.")
 
-        data = np.array(eeg_stream["time_series"]).T.astype(np.float32) * 1e-6
+        data  = np.array(eeg_stream["time_series"]).T.astype(np.float32) * 1e-6
         sfreq = float(eeg_stream["info"]["nominal_srate"][0])
-
-        info = mne.create_info(
-            ch_names=self.cfg.channel_names,
-            sfreq=sfreq,
-            ch_types=["eeg"] * 8,
+        info  = mne.create_info(
+            ch_names=self.cfg.channel_names, sfreq=sfreq, ch_types=["eeg"] * 8
         )
         return mne.io.RawArray(data, info, verbose=False)
 
@@ -719,30 +721,21 @@ class UnicornProcessor(SignalProcessor):
     def preprocess(self) -> mne.io.BaseRaw:
         """
         Butterworth bandpass filter (Alpha + Beta: 8–30 Hz), zero-phase.
-
-        Why Butterworth over FIR here?
-          • Unicorn sfreq=250 Hz → 8–30 Hz is a wide relative band; Butterworth
-            order 4 gives −80 dB/decade with minimal ringing in the 1.2 s window.
-          • FIR at 8 Hz lower-cutoff would require ~3*(250/8) ≈ 94 taps → 376 ms
-            of edge effects on a 1200 ms epoch — too costly for the short window.
-
-        Note: we skip CAR. With 8 scalp electrodes, the CAR mean is dominated
-        by occipital alpha, which would subtract genuine signal from frontal/
-        central channels (C3, Cz, C4) used for motor-imagery decoding.
+        Applied channel-by-channel to keep peak RAM at O(one channel).
         """
-        sfreq = self._raw.info["sfreq"]
+        sfreq     = self._raw.info["sfreq"]
         low, high = self.cfg.ab_band
-        nyq = sfreq / 2.0
+        nyq       = sfreq / 2.0
 
-        log.info("  Bandpass filter: %.1f–%.1f Hz (Butterworth order %d) …",
-                 low, high, self.cfg.butter_order)
-
+        log.info(
+            "  Bandpass filter: %.1f–%.1f Hz (Butterworth order %d) …",
+            low, high, self.cfg.butter_order,
+        )
         b, a = sig.butter(
             N=self.cfg.butter_order,
             Wn=[low / nyq, high / nyq],
             btype="bandpass",
         )
-
         eeg_picks = mne.pick_types(self._raw.info, eeg=True)
         for ch_idx in eeg_picks:
             ch_data = self._raw._data[ch_idx, :]
@@ -751,26 +744,198 @@ class UnicornProcessor(SignalProcessor):
         gc.collect()
         return self._raw
 
-    # ── 3c. Epoching ──────────────────────────────────────────────────────────
+    # ── 3c. Epoch from pre-computed flash times ───────────────────────────────
+
+    def _epoch_from_flash_seconds(
+        self,
+        raw: mne.io.BaseRaw,
+        flash_seconds: np.ndarray,
+        labels: np.ndarray,
+        label_map: dict,
+    ) -> mne.Epochs:
+        """
+        Build an MNE Epochs object from absolute flash onset times (seconds).
+
+        Unlike the ECoG path (which detects onsets from the photodiode), Unicorn
+        CSVs have no trigger channel.  Instead we project the ECoG-derived onset
+        times into Unicorn sample space:
+
+            unicorn_sample = round(flash_second * unicorn_sfreq)
+
+        Parameters
+        ----------
+        raw           : filtered Unicorn RawArray
+        flash_seconds : (n_trials,) onset times in seconds, already offset-corrected
+        labels        : (n_trials,) integer class codes  (1=color, 2=shape, 3=face)
+        label_map     : {int: str} for MNE event_id  (e.g. {1:"color", 2:"shape",...})
+        """
+        sfreq      = raw.info["sfreq"]
+        n_samples  = raw.n_times
+
+        flash_samples = np.round(flash_seconds * sfreq).astype(np.int32)
+
+        # Guard: discard any events that would fall outside the recording
+        tmin_samp = int(np.round(self.epoch_cfg.tmin * sfreq))   # negative offset
+        tmax_samp = int(np.round(self.epoch_cfg.tmax * sfreq))
+
+        valid_mask = (
+            (flash_samples + tmin_samp >= 0) &
+            (flash_samples + tmax_samp <  n_samples)
+        )
+        n_dropped = (~valid_mask).sum()
+        if n_dropped:
+            log.warning(
+                "  Dropped %d events outside recording bounds "
+                "(offset may push early flashes before t=0 or beyond EOF).",
+                n_dropped,
+            )
+
+        flash_samples = flash_samples[valid_mask]
+        labels_valid  = labels[valid_mask]
+
+        # MNE events: (n_events, 3) — [sample_idx, 0, event_id]
+        events = np.column_stack([
+            flash_samples,
+            np.zeros(len(flash_samples), dtype=np.int32),
+            labels_valid.astype(np.int32),
+        ])
+
+        event_id = {label_map[c]: int(c) for c in np.unique(labels_valid) if c in label_map}
+        log.info("  Built %d epochs from flash times  |  event_id: %s", len(events), event_id)
+
+        epochs = mne.Epochs(
+            raw,
+            events=events,
+            event_id=event_id,
+            tmin=self.epoch_cfg.tmin,
+            tmax=self.epoch_cfg.tmax,
+            baseline=self.epoch_cfg.baseline,
+            picks=mne.pick_types(raw.info, eeg=True),
+            preload=False,   # lazy — stream in _build_features chunks
+            verbose=False,
+        )
+        return epochs
+
+    # ── 3d. Single-file run (legacy) ──────────────────────────────────────────
+
+    def run(self, path: Path) -> Tuple[np.ndarray, np.ndarray]:
+        """Legacy single-file run — kept for backward compatibility."""
+        log.info("[UnicornProcessor] Loading: %s", path.name)
+        self._raw = self.load_raw(path)
+        self._raw = self.preprocess()
+        epochs    = self.extract_epochs()   # uses STI014 trigger channel
+        X, y      = self._build_features(epochs)
+        del epochs, self._raw
+        self._raw = None
+        gc.collect()
+        return X, y
+
+    # ── 3e. Multi-file run (6-CSV experiment) ─────────────────────────────────
+
+    def run_multi_file(
+        self,
+        unicorn_files:       list,           # [(Path, offset_seconds), ...]
+        ecog_flash_seconds:  np.ndarray,     # (126,) from ECoGProcessor.ecog_flash_seconds
+        real_labels:         np.ndarray,     # (126,) integer codes 1/2/3
+        label_map:           dict,           # {1: "color", 2: "shape", 3: "face"}
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Iterate over multiple Unicorn CSV files, epoch each using ECoG-derived
+        flash times (shifted by the file's video-start offset), extract features,
+        then concatenate across files.
+
+        Memory model (M3 · 8 GB)
+        -------------------------
+        Each CSV: ~250 Hz × ~300 s × 8 ch × 4 B ≈ 2.4 MB — negligible.
+        Epoch tensor per file: 126 epochs × 8 ch × 301 samples × 4 B ≈ 1.2 MB.
+        Feature matrix per file: (126, 8) × 4 B ≈ 4 KB.
+        Peak usage is dominated by the filtered Raw, freed after each iteration.
+
+        Parameters
+        ----------
+        unicorn_files       : list of (Path, float) — file path + video-start offset
+        ecog_flash_seconds  : absolute flash times from ECoG (t=0 is ECoG recording start)
+        real_labels         : (n_trials,) — same 126 labels used for ECoG
+        label_map           : {int: str} — class code → human label
+
+        Returns
+        -------
+        X_total : (n_files × n_trials, 8)   e.g. (756, 8)
+        y_total : (n_files × n_trials,)     e.g. (756,)
+        """
+        X_parts, y_parts = [], []
+
+        for file_idx, (csv_path, offset) in enumerate(unicorn_files, start=1):
+            csv_path = Path(csv_path)
+            log.info(
+                "[UnicornProcessor] File %d/%d — %s  (offset=%.1f s)",
+                file_idx, len(unicorn_files), csv_path.name, offset,
+            )
+
+            # ── Load ──────────────────────────────────────────────────────────
+            self._raw = self.load_raw(csv_path)
+
+            # ── Bandpass ──────────────────────────────────────────────────────
+            self._raw = self.preprocess()
+
+            # ── Shift flash times into this file's time axis ──────────────────
+            # ECoG times are relative to ECoG t=0.  The video started at
+            # `offset` seconds into this Unicorn file, so flash times measured
+            # from Unicorn t=0 are:
+            #   unicorn_flash = ecog_flash_seconds + offset
+            unicorn_flash_seconds = ecog_flash_seconds + offset
+            log.info(
+                "  Flash window in Unicorn time: %.2f – %.2f s",
+                unicorn_flash_seconds[0], unicorn_flash_seconds[-1],
+            )
+
+            # ── Epoch ─────────────────────────────────────────────────────────
+            epochs = self._epoch_from_flash_seconds(
+                self._raw, unicorn_flash_seconds, real_labels, label_map
+            )
+
+            # ── Feature extraction (chunked, OOM-safe) ─────────────────────────
+            log.info("  Extracting features (chunk_size=%d) …", self.epoch_cfg.chunk_size)
+            X_file, y_file = self._build_features(epochs)
+            log.info("  File features: X=%s  y=%s", X_file.shape, y_file.shape)
+
+            X_parts.append(X_file)
+            y_parts.append(y_file)
+
+            # ── Explicit cleanup — free filtered Raw + epoch table ─────────────
+            del epochs, self._raw, unicorn_flash_seconds
+            self._raw = None
+            gc.collect()
+
+        # ── Concatenate across all files ──────────────────────────────────────
+        X_total = np.concatenate(X_parts, axis=0)   # (n_files × 126, 8)
+        y_total = np.concatenate(y_parts, axis=0)   # (n_files × 126,)
+        del X_parts, y_parts
+        gc.collect()
+
+        log.info(
+            "[UnicornProcessor] Multi-file complete — X_total: %s  y_total: %s  "
+            "classes: %s",
+            X_total.shape, y_total.shape, np.unique(y_total).tolist(),
+        )
+        return X_total, y_total
+
+    # ── 3f. Legacy extract_epochs (STI014-based, kept for completeness) ───────
 
     def extract_epochs(self) -> mne.Epochs:
-        """
-        Identical epoching logic to ECoGProcessor — demonstrates the shared
-        contract enforced by the base class.
-        """
+        """Legacy trigger-channel epoching — used only by single-file ``run()``."""
         try:
             events = mne.find_events(self._raw, stim_channel="STI014", verbose=False)
         except ValueError:
-            # Fallback: derive events from annotation if no STIM channel
             events, _ = mne.events_from_annotations(self._raw, verbose=False)
 
         if events.shape[0] == 0:
             raise ValueError("No events found — check trigger column or annotations.")
 
         unique_codes = np.unique(events[:, 2])
-        event_id = {f"stim_{c}": int(c) for c in unique_codes}
+        event_id     = {f"stim_{c}": int(c) for c in unique_codes}
 
-        epochs = mne.Epochs(
+        return mne.Epochs(
             self._raw,
             events=events,
             event_id=event_id,
@@ -778,12 +943,9 @@ class UnicornProcessor(SignalProcessor):
             tmax=self.epoch_cfg.tmax,
             baseline=self.epoch_cfg.baseline,
             picks=mne.pick_types(self._raw.info, eeg=True),
-            preload=False,   # lazy — crucial for long Unicorn sessions
+            preload=False,
             verbose=False,
         )
-        return epochs
-
-
 # =============================================================================
 # 4. Machine Learning Pipeline
 # =============================================================================
@@ -948,30 +1110,77 @@ class BCIExperiment:
 
     def run(
         self,
-        ecog_mat_path: Optional[Path] = None,
-        unicorn_csv_path: Optional[Path] = None,
-        label_map: Optional[dict] = None,
+        ecog_mat_path:    Optional[Path] = None,
+        unicorn_files:    Optional[list] = None,   # [(Path, offset_s), ...]
+        label_map:        Optional[dict] = None,
     ) -> dict:
         """
         Execute both pipelines and return a dict with all metrics.
-        Either pipeline path may be None to run a single-modality experiment.
-        """
-        all_results = {}
 
+        Parameters
+        ----------
+        ecog_mat_path : Path to Walk.mat  (None = skip ECoG pipeline)
+        unicorn_files : list of (Path, float) tuples — CSV path + video-start offset
+                        e.g. [("rec1.csv", 0.0), ("rec3.csv", 15.0), ...]
+                        None = skip Unicorn pipeline
+        label_map     : {int: str}  e.g. {1: "color", 2: "shape", 3: "face"}
+        """
+        all_results      = {}
+        ecog_flash_secs  = None   # set below; passed into Unicorn pipeline
+
+        # ── ECoG pipeline ─────────────────────────────────────────────────────
         if ecog_mat_path is not None:
             log.info("=== ECoG Pipeline ===")
             X_ecog, y_ecog = self.ecog_proc.run(ecog_mat_path)
+
+            # Flash times are now available as a side-effect of ECoGProcessor.run()
+            ecog_flash_secs = self.ecog_proc.ecog_flash_seconds
+            log.info(
+                "  ECoG flash times exposed: %d events  (%.2f – %.2f s)",
+                len(ecog_flash_secs), ecog_flash_secs[0], ecog_flash_secs[-1],
+            )
+
             results_ecog = self.classifier.fit_evaluate(X_ecog, y_ecog, label_map)
             BCIClassifier.print_results(results_ecog, "ECoG (intracranial)")
             all_results["ECoG"] = results_ecog
             del X_ecog, y_ecog
             gc.collect()
 
-        if unicorn_csv_path is not None:
-            log.info("=== Unicorn Pipeline ===")
-            X_uni, y_uni = self.unicorn_proc.run(unicorn_csv_path)
+        # ── Unicorn multi-file pipeline ────────────────────────────────────────
+        if unicorn_files is not None:
+            if ecog_flash_secs is None:
+                raise RuntimeError(
+                    "Unicorn multi-file pipeline requires ECoG flash times. "
+                    "Run the ECoG pipeline first (pass ecog_mat_path) or "
+                    "provide ecog_flash_seconds directly."
+                )
+
+            log.info("=== Unicorn EEG Pipeline (%d files) ===", len(unicorn_files))
+
+            # The same 126-trial label sequence applies to every file
+            real_labels = np.array([
+                1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 2, 2, 2, 2, 1, 2, 2, 1, 1, 1,
+                3, 3, 3, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1, 1,
+                2, 2, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1,
+                1, 1, 2, 2, 3, 3, 3, 1, 1, 1, 1, 3, 3, 3, 1, 1, 2, 2, 3, 3, 1, 1, 1, 2,
+                2, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2,
+                2, 2, 3, 3, 3, 3,
+            ], dtype=np.int32)
+
+            X_uni, y_uni = self.unicorn_proc.run_multi_file(
+                unicorn_files      = unicorn_files,
+                ecog_flash_seconds = ecog_flash_secs,
+                real_labels        = real_labels,
+                label_map          = label_map or {1: "color", 2: "shape", 3: "face"},
+            )
+            log.info(
+                "  Concatenated dataset — X: %s  y: %s  class distribution: %s",
+                X_uni.shape, y_uni.shape,
+                {int(c): int((y_uni == c).sum()) for c in np.unique(y_uni)},
+            )
+
             results_uni = self.classifier.fit_evaluate(X_uni, y_uni, label_map)
-            BCIClassifier.print_results(results_uni, "Unicorn EEG (scalp)")
+            BCIClassifier.print_results(results_uni, "Unicorn EEG (scalp, 6-file)")
             all_results["Unicorn"] = results_uni
             del X_uni, y_uni
             gc.collect()
@@ -1093,18 +1302,34 @@ if __name__ == "__main__":
     #       behavioural log is wired into extract_epochs().
     label_map = {1: "color", 2: "shape", 3: "face"}
 
+# ── Unicorn file list (offset = seconds from Unicorn t=0 to video start) ──
+    UNICORN_DIR   = Path("unicorn")
+    unicorn_files = [
+        (UNICORN_DIR / "1/1RAW.csv",  0.0),
+        (UNICORN_DIR / "2/2RAW.csv",  0.0),
+        (UNICORN_DIR / "3/3RAW.csv", 15.0),
+        (UNICORN_DIR / "4/4RAW.csv", 15.0),
+        (UNICORN_DIR / "5/5RAW.csv", 15.0),
+        (UNICORN_DIR / "6/6RAW.csv", 15.0),
+    ]
+    # Filter to files that actually exist — allows partial runs during dev
+    unicorn_files = [(p, o) for p, o in unicorn_files if Path(p).exists()]
+    if not unicorn_files:
+        log.warning("No Unicorn CSV files found in %s — skipping Unicorn pipeline.", UNICORN_DIR)
+        unicorn_files = None
+
     # ── Run experiment ────────────────────────────────────────────────────────
     experiment = BCIExperiment(
-        epoch_cfg  = epoch_cfg,
-        ecog_cfg   = ecog_cfg,
+        epoch_cfg   = epoch_cfg,
+        ecog_cfg    = ecog_cfg,
         unicorn_cfg = uni_cfg,
         n_cv_splits = args.cv_splits,
     )
 
     results = experiment.run(
-        ecog_mat_path    = ECOG_PATH,
-        unicorn_csv_path = UNICORN_PATH,
-        label_map        = label_map,
+        ecog_mat_path = ECOG_PATH,
+        unicorn_files = unicorn_files,
+        label_map     = label_map,
     )
 
     log.info("Pipeline complete.")
