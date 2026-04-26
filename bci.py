@@ -1,32 +1,19 @@
 """
-=============================================================================
-BCI Dual-Pipeline: ECoG vs. Unicorn Hybrid Black — Comparative Classifier
-=============================================================================
-Author:  Neuro-Data Engineering Template
-Target:  Apple M3 · 8 GB unified memory
-Deps:    mne>=1.7, scipy>=1.13, scikit-learn>=1.5, numpy>=1.26, h5py>=3.11
-
-Design philosophy
------------------
-OOM on M3/8 GB is the primary engineering constraint. Every stage therefore
-follows three rules:
-  1. LAZY LOAD  – raw files are memory-mapped via MNE (preload=False), so
-                  only metadata + requested slices hit RAM.
-  2. CHUNK      – epoching and feature extraction iterate in fixed-size
-                  batches; the full epoch tensor is never materialised.
-  3. GC EXPLICIT– del + gc.collect() after every major allocation so the
-                  Python GC doesn't wait for the next collection cycle.
+"ECoG Video Watching Analysis" by Horizons team
+Horizons are:
+Tobias Fleitas,
+Makar Lavrov
 
 DSP conventions
 ---------------
 * All filters are zero-phase (filtfilt / MNE forward–backward) to avoid
   group-delay artefacts that would shift neural response latency.
-* Notch filter Q=30 → bandwidth ≈ powerline_freq/30 ≈ 1.67 Hz @50 Hz —
+* Notch filter Q=30 -> bandwidth ≈ powerline_freq/30 ≈ 1.67 Hz @50 Hz —
   narrow enough to preserve broadband signal, wide enough to kill harmonics.
 * CAR (Common Average Reference) approximates a Laplacian on dense arrays
   and suppresses common-mode noise. Applied AFTER notch to avoid referencing
   noise back in.
-* High-Gamma envelope: bandpass FIR (zero-phase, Kaiser window) → |Hilbert|.
+* High-Gamma envelope: bandpass FIR (zero-phase, Kaiser window) -> |Hilbert|.
   The Hilbert approach preserves instantaneous amplitude modulation; a simple
   power-of-filtered-signal would introduce rectification artefacts.
 * Epoching baseline: −0.2 s is long enough to estimate a pre-stimulus mean
@@ -59,7 +46,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import SVC
 
-# ── Silence MNE's verbose channel-type warnings in pipeline contexts ──────────
+# silencing MNE's verbose channel-type warnings in pipeline contexts
 mne.set_log_level("WARNING")
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="mne")
 
@@ -70,9 +57,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("bci_pipeline")
 
-
 # =============================================================================
-# 0. Configuration dataclasses — single source of truth for all hyperparameters
+# Configuration dataclasses
 # =============================================================================
 
 @dataclass
@@ -91,31 +77,31 @@ class ECoGConfig:
     ECoG-specific DSP parameters — configured for Walk.mat clinical dataset.
 
     Walk.mat column layout (0-based Python indices):
-      Col  0        : Time vector  → discard, MNE owns the time axis
+      Col  0        : Time vector  -> discard, MNE owns the time axis
       Cols 1–160    : 160 ECoG electrodes  (n_ecog_channels)
       Col  161      : Photodiode  (binary 0/1, rising edge = stimulus onset)
       Col  162      : StimCode    (1=pre-paradigm, 2=video playing, 3=post)
-      Col  163      : GroupId     → discard
+      Col  163      : GroupId     -> discard
     """
     sfreq_expected:    float = 1200.0   # Hz — Walk.mat acquisition rate
 
-    # ── Column indices (0-based) ──────────────────────────────────────────────
+    # column indices (0-based)
     mat_variable:      str   = "y"
-    n_ecog_channels:   int   = 160      # total electrodes in file (do not change)
-    ecog_col_start:    int   = 1        # kept for reference; ROI slicing overrides
+    n_ecog_channels:   int   = 160      # total electrodes in file
+    ecog_col_start:    int   = 1        # kept for reference, ROI slicing overrides
     ecog_col_stop:     int   = 161
     photodiode_col:    int   = 161
     stimcode_col:      int   = 162
     stimcode_video:    int   = 2
     photodiode_thresh: float = 0.5
 
-    # ── ROI: visual / temporal / occipital channels (1-based, from electrode map)
-    # Channels 1–60   → dense frontal/motor grid            → EXCLUDED
-    # Channels 61–100 → posterior temporal, lateral occipital (lateral view) → included
-    # Channels 101–160→ inferior temporal, fusiform, ventral occipital       → included
+    # ROI: visual / temporal / occipital channels (1-based, from electrode map)
+    # channels 1–60 -> dense frontal/motor grid (excluded to avoid muscle artefacts and non-visual responses)
+    # channels 61–100 -> posterior temporal, lateral occipital (lateral view)
+    # channels 101–160 -> inferior temporal, fusiform, ventral occipital
     roi_channels: list = field(default_factory=lambda: list(range(61, 161)))
 
-    # ── DSP parameters ────────────────────────────────────────────────────────
+    # DSP parameters
     notch_freqs: list = field(default_factory=lambda: [50.0, 100.0, 150.0])
     notch_q: float = 30.0
     hg_band: Tuple[float, float] = (70.0, 150.0)
@@ -133,14 +119,13 @@ class UnicornConfig:
     # High-Gamma (>70 Hz) is heavily attenuated by the skull (≈40 dB/decade),
     # dura, CSF, and scalp, so it is physiologically inaccessible at the scalp.
     ab_band: Tuple[float, float] = (1.0, 50.0)
-    # Butterworth order 4 → −80 dB/decade roll-off; sufficient for Alpha/Beta
-    # without excessive filter ringing on the short 1.2 s epoch window.
-    butter_order: int = 4
+    butter_order: int = 4 # order of the Butterworth bandpass filter
     trigger_column: str = "Trigger"  # column name in the Unicorn CSV export
 
 
 # =============================================================================
-# 1. Abstract base class — defines the contract every processor must fulfil
+# Abstract base class
+# Definition of the contract every processor must fulfil
 # =============================================================================
 
 class SignalProcessor(abc.ABC):
@@ -148,16 +133,14 @@ class SignalProcessor(abc.ABC):
     Abstract base for a single-modality BCI preprocessing pipeline.
 
     Concrete subclasses implement:
-      * load_raw()      → mne.io.BaseRaw  (lazy, preload=False)
-      * preprocess()    → mne.io.BaseRaw  (filtered, referenced, still lazy)
-      * extract_epochs()→ Generator yielding (X_chunk, y_chunk) pairs
+      * load_raw()      -> mne.io.BaseRaw  (lazy, preload=False)
+      * preprocess()    -> mne.io.BaseRaw  (filtered, referenced, still lazy)
+      * extract_epochs()-> Generator yielding (X_chunk, y_chunk) pairs
     """
 
     def __init__(self, epoch_cfg: EpochConfig):
         self.epoch_cfg = epoch_cfg
         self._raw: Optional[mne.io.BaseRaw] = None
-
-    # ── public interface ──────────────────────────────────────────────────────
 
     @abc.abstractmethod
     def load_raw(self, path: Path) -> mne.io.BaseRaw:
@@ -200,8 +183,7 @@ class SignalProcessor(abc.ABC):
         log.info("[%s] Extracting epochs …", self.__class__.__name__)
         epochs = self.extract_epochs()
 
-        # ── Expose flash times for cross-modality sync ────────────────────────
-        # epochs.events[:, 0] = sample index at 1200 Hz → divide by sfreq
+        # Expose flash times for cross-modality sync
         self.ecog_flash_seconds: np.ndarray = (
             epochs.events[:, 0].astype(np.float64) / self.cfg.sfreq_expected
         )
@@ -224,26 +206,20 @@ class SignalProcessor(abc.ABC):
         log.info("[%s] Done — X: %s  y: %s", self.__class__.__name__, X.shape, y.shape)
         return X, y
 
-    # ── shared helper — chunked feature extraction ────────────────────────────
-
     def _build_features(
         self, epochs: mne.Epochs
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Iterate over epochs in fixed-size chunks to avoid materialising the
+        iterating over epochs in fixed-size chunks to avoid materialising the
         full (n_epochs × n_channels × n_times) tensor.
 
-        Feature definition: mean squared amplitude over the epoch window per
+        mean squared amplitude over the epoch window per
         channel = mean instantaneous power (band-limited by preprocessing).
-        For ECoG this is mean high-gamma envelope²; for Unicorn it is mean
-        alpha/beta power.  Squaring converts amplitude → power units.
 
-        Shape contract: each chunk contributes rows to X of shape (chunk, C);
+        each chunk contributes rows to X of shape (chunk, C);
         stacking yields (n_epochs, n_channels).
         """
-        # drop_bad() validates epoch integrity (annotations, rejection thresholds)
-        # without loading raw data into RAM. Must precede len() when preload=False,
-        # because MNE can't know n_epochs until bad epochs are dropped.
+
         epochs.drop_bad(verbose=False)
 
         X_parts, y_parts = [], []
@@ -252,16 +228,16 @@ class SignalProcessor(abc.ABC):
 
         for start in range(0, n_total, chunk):
             stop = min(start + chunk, n_total)
-            # epochs[start:stop].get_data() → (batch, channels, times)
-            # Using copy=False avoids an extra allocation where MNE allows it.
+
             data_chunk = epochs[start:stop].get_data(copy=False)  # (B, C, T)
 
-            # Mean power = mean(signal²) over time axis → (B, C)
+            # Mean power = mean(signal squared) over time axis -> (B, C)
             power = np.mean(data_chunk ** 2, axis=-1)
             X_parts.append(power)
             y_parts.append(epochs[start:stop].events[:, 2])  # event id column
 
-            # Release the chunk immediately
+
+            # realeasing the chunks from memory to save RAM
             del data_chunk
             gc.collect()
 
@@ -271,18 +247,17 @@ class SignalProcessor(abc.ABC):
 
 
 # =============================================================================
-# 2. ECoG Processor
+# ECoG Processor
 # =============================================================================
 
 class ECoGProcessor(SignalProcessor):
     """
-    Preprocessing pipeline for intracranial ECoG recordings stored in MATLAB
-    .mat files (v7.3 / HDF5 or legacy v5 via scipy.io).
+    Pipeline order:
+      load  notch -> CAR -> HG bandpass -> Hilbert envelope -> epoch
 
-    Pipeline order matters:
-      load → notch → CAR → HG bandpass → Hilbert envelope → epoch
-
-    CAR before bandpass: referencing in broadband prevents the HG bandpass
+    CAR before bandpass!!
+    
+    referencing in broadband prevents the HG bandpass
     from creating reference-channel–specific spectral artefacts.
     """
 
@@ -290,62 +265,48 @@ class ECoGProcessor(SignalProcessor):
         super().__init__(epoch_cfg)
         self.cfg = ecog_cfg
 
-    # ── 2a. Loading ───────────────────────────────────────────────────────────
-
+    # loading
     def load_raw(self, path: Path) -> mne.io.BaseRaw:
-        """
-        Ingest Walk.mat into an MNE RawArray with strict OOM prevention.
 
-        Walk.mat layout  (346 903 samples × 164 columns, float64):
-          y[:, 0]        — Time vector           → discard
-          y[:, 1:161]    — 160 ECoG electrodes   → ECoG channels
-          y[:, 161]      — Photodiode (0/1)       → STIM channel "Photodiode"
-          y[:, 162]      — StimCode (1/2/3)       → STIM channel "StimCode"
-          y[:, 163]      — GroupId                → discard
-        """
         cfg = self.cfg
         sfreq = cfg.sfreq_expected
 
         if path.suffix.lower() != ".mat":
             raise ValueError(f"ECoGProcessor expects a .mat file, got: {path.suffix}")
+        
 
-        # ── Step A: Targeted load — only the 'y' variable, nothing else ───────
-        # variable_names= prevents scipy from deserialising every workspace var.
-        # For a 164-column mat this is modest, but good practice for labs that
-        # store multiple large arrays (e.g., pre-processed copies) in one file.
+        # loading only y variable
         log.info("  scipy.io.loadmat('%s', variable_names=['%s']) …", path.name, cfg.mat_variable)
         mat = sio.loadmat(str(path), variable_names=[cfg.mat_variable])
         y = mat[cfg.mat_variable]
         
-        # scipy loads it that way too, but the rest of the code expects (n_samples, 164)
+        
         if y.ndim == 2 and y.shape[0] < y.shape[1]:
             y = y.T
 
         log.info("  Raw matrix shape: %s  dtype: %s", y.shape, y.dtype)
         n_samples = y.shape[0]
 
-        # ── Step B: Slice ROI channels and downcast BEFORE freeing y ──────────
-        # roi_channels are 1-based electrode numbers; in the y matrix col 0 is
-        # the time vector, so channel N sits at column index N — no offset needed.
-        roi_cols = cfg.roi_channels                          # e.g. [61, 62, …, 160]
+        # slicing ROI channels and downcasting
+  
+        roi_cols = cfg.roi_channels                          # [61, 62, etc., 160]
         n_roi    = len(roi_cols)
 
         log.info("  Slicing %d ROI channels %d–%d, Photodiode [%d], StimCode [%d] …",
                  n_roi, roi_cols[0], roi_cols[-1],
                  cfg.photodiode_col, cfg.stimcode_col)
 
-        # Advanced index → contiguous copy → transpose to (n_roi, n_samples)
         ecog_data  = y[:, roi_cols].T.astype(np.float32)    # (n_roi, n_samples)
         photodiode = y[:, cfg.photodiode_col].astype(np.float32)
         stimcode   = y[:, cfg.stimcode_col  ].astype(np.float32)
 
-        # ── Step C: CRITICAL — free the full float64 matrix NOW ───────────────
+        # freeing the original matrix to save RAM
         del y, mat
         gc.collect()
         log.info("  Original matrix freed.  ROI ECoG array: %s  (%.1f MB)",
                  ecog_data.shape, ecog_data.nbytes / 1e6)
 
-        # ── Step D: Build MNE RawArray for ROI channels only ──────────────────
+        # building MNE RawArray for ROI channels only
         ch_names = [f"ECoG{ch:03d}" for ch in roi_cols]     # e.g. ECoG061…ECoG160
         info = mne.create_info(
             ch_names=ch_names,
@@ -356,9 +317,7 @@ class ECoGProcessor(SignalProcessor):
         del ecog_data
         gc.collect()
 
-        # ── Step E: Append Photodiode + StimCode as named STIM channels ───────
-        # Naming them explicitly (not "STI014") lets extract_epochs() retrieve
-        # them by name, which is more robust than relying on channel order.
+        # Photodiode + StimCode
         aux_data = np.vstack([photodiode[np.newaxis, :], stimcode[np.newaxis, :]])
         aux_info = mne.create_info(
             ch_names=["Photodiode", "StimCode"],
@@ -375,20 +334,13 @@ class ECoGProcessor(SignalProcessor):
                  cfg.n_ecog_channels, n_samples / sfreq, sfreq)
         return raw
 
-    # ── 2b. Preprocessing ─────────────────────────────────────────────────────
-
+    # preprocessing
     def preprocess(self) -> mne.io.BaseRaw:
-        """
-        Step 1 — Notch filter at powerline frequency and harmonics.
-        Step 2 — Common Average Reference (CAR).
-        Step 3 — High-Gamma bandpass (FIR, zero-phase) + Hilbert envelope.
-        """
+
         raw = self._raw
         ecog_picks = mne.pick_types(raw.info, ecog=True)
 
-        # ── Step 1: Notch filter ──────────────────────────────────────────────
-        # IIR notch via scipy applied in-place channel-by-channel to avoid
-        # building a (n_ch, n_times) float64 array in one shot.
+        # Notch filter 
         log.info("  Applying notch filters at: %s Hz", self.cfg.notch_freqs)
         for freq in self.cfg.notch_freqs:
             b_notch, a_notch = sig.iirnotch(
@@ -396,34 +348,23 @@ class ECoGProcessor(SignalProcessor):
                 Q=self.cfg.notch_q,
                 fs=raw.info["sfreq"],
             )
-            # Process one channel at a time → peak RAM = 2 × (1 × n_times × 4 B)
+
             for ch_idx in ecog_picks:
                 ch_data, _ = raw[ch_idx, :]          # (1, T)
                 filtered = sig.filtfilt(b_notch, a_notch, ch_data[0])
                 raw._data[ch_idx, :] = filtered.astype(np.float32)
             gc.collect()
 
-        # ── Step 2: Common Average Reference (CAR) ────────────────────────────
-        # CAR subtracts the instantaneous mean across all ECoG electrodes from
-        # each electrode. Equivalent to a spatial high-pass filter that removes
-        # volume-conducted far-field potentials and reference noise.
-        # We compute the mean row-wise to avoid a full copy: CAR = X - mean(X, axis=0)
+        # CAR
+        # subtracts the instantaneous mean across all ECoG electrodes from each electrode
         log.info("  Applying Common Average Reference (CAR) …")
-        # Load only ECoG channels into RAM for this computation
-        ecog_data = raw._data[ecog_picks, :]   # view, not copy (float32)
+        ecog_data = raw._data[ecog_picks, :] 
         car_mean = ecog_data.mean(axis=0, keepdims=True)   # (1, T)
-        raw._data[ecog_picks, :] -= car_mean   # in-place
+        raw._data[ecog_picks, :] -= car_mean 
         del car_mean
         gc.collect()
 
-        # ── Step 3: High-Gamma bandpass + Hilbert envelope ────────────────────
-        # Why FIR over IIR here?
-        #   • FIR filters have linear phase → zero-phase after filtfilt, so
-        #     temporal alignment of the envelope to triggers is preserved.
-        #   • IIR Butterworth at 70–150 Hz on a 1 kHz signal would require very
-        #     high order for the steep roll-off needed to exclude Beta bleedthrough.
-        # Kaiser window: β=8.6 → −80 dB stop-band attenuation; good for BCI
-        # where 60–70 Hz noise can alias into the HG band.
+        # High-Gamma bandpass + Hilbert envelope
         log.info("  Computing High-Gamma (%.0f–%.0f Hz) envelope …", *self.cfg.hg_band)
         sfreq = raw.info["sfreq"]
         nyq = sfreq / 2.0
@@ -439,8 +380,7 @@ class ECoGProcessor(SignalProcessor):
         for ch_idx in ecog_picks:
             ch_data = raw._data[ch_idx, :]                    # view (T,)
             filtered = sig.filtfilt(b_hg, [1.0], ch_data)    # zero-phase BPF
-            # Hilbert transform: analytic signal → take |·| for amplitude envelope
-            # np.abs of complex Hilbert output = instantaneous amplitude
+            # Hilbert transform
             envelope = np.abs(sig.hilbert(filtered)).astype(np.float32)
             raw._data[ch_idx, :] = envelope
             del filtered, envelope
@@ -448,65 +388,23 @@ class ECoGProcessor(SignalProcessor):
         gc.collect()
         return raw
 
-    # ── 2c. Epoching ──────────────────────────────────────────────────────────
-
+    # epoching 
     def extract_epochs(self) -> mne.Epochs:
-        """
-        Detect photodiode rising edges, gate by StimCode==2, assign labels.
-
-        Why photodiode instead of a digital trigger channel?
-        -------------------------------------------------------
-        Clinical ECoG systems often lack a dedicated TTL input, so experimenters
-        use a photodiode taped to a corner of the stimulus monitor.  The diode
-        voltage transitions 0→1 at the exact frame that the stimulus appears,
-        giving sub-millisecond precision at 1200 Hz (≈0.83 ms per sample).
-
-        Gating by StimCode==2 ("video playing"):
-        ---------------------------------------------------------------
-        The Walk.mat paradigm has three phases:
-          1 = pre-paradigm  (baseline rest, no stimuli)
-          2 = video playing (the condition we care about)
-          3 = post-paradigm (recovery, no stimuli)
-        Photodiode noise or screen refresh artefacts may fire spurious rising
-        edges during phases 1 and 3.  The StimCode gate cleanly rejects these
-        without any amplitude thresholding on the neural channels.
-
-        Label assignment (placeholder — TODO for real data):
-        ---------------------------------------------------------------
-        Walk.mat does not embed per-trial category labels in the matrix itself.
-        Labels must come from a separate behavioural log (e.g., a .csv that
-        records which colour/shape/face was shown for each photodiode flash).
-        Until that log is provided, we cycle through [1, 2, 3] sequentially.
-        """
         cfg = self.cfg
         raw = self._raw
 
-        # ── 1. Pull Photodiode and StimCode arrays into RAM ───────────────────
-        # raw[channel_name, :] returns (1, T); squeeze to (T,).
-        # These are small (346 903 × 4 B ≈ 1.4 MB each) — safe to load fully.
         photodiode = raw["Photodiode"][0][0]   # (T,) float32
         stimcode   = raw["StimCode"  ][0][0]   # (T,) float32
 
-        # ── 2. Detect rising edges on the Photodiode channel ──────────────────
-        # A rising edge occurs where the signal crosses from below to above
-        # the threshold.  We diff on a boolean array to avoid floating-point
-        # precision issues with the 0/1 signal.
-        #
-        # Derivation:
-        #   is_high[t]  = photodiode[t] >= thresh        → boolean mask
-        #   rising[t]   = is_high[t] AND NOT is_high[t-1]
-        #   Sample index of the rising edge = t (the first HIGH sample).
-        #   We add +1 because is_high[1:] corresponds to original index 1..T-1.
+        # detecting rising edges on the photodiode channel 
         thresh   = cfg.photodiode_thresh
         is_high  = photodiode >= thresh                     # (T,) bool
         rising   = is_high[1:] & ~is_high[:-1]             # (T-1,) bool
-        all_rising_samples = np.where(rising)[0] + 1       # 1-based correction
+        all_rising_samples = np.where(rising)[0] + 1       # add +1 because is_high[1:] corresponds to original index 1..T-1.
 
         log.info("  Photodiode: %d total rising edges detected", len(all_rising_samples))
 
-        # ── 3. Gate: keep only events where StimCode == 2 ─────────────────────
-        # Index into stimcode at the exact rising-edge sample to check the
-        # paradigm phase at that moment.  Cast to int for exact equality.
+        # keeping only events where StimCode == 2 
         stim_at_onset = stimcode[all_rising_samples].astype(np.int32)
         video_mask    = stim_at_onset == cfg.stimcode_video
         valid_samples = all_rising_samples[video_mask]
@@ -527,22 +425,10 @@ class ECoGProcessor(SignalProcessor):
                 f"and that StimCode value {cfg.stimcode_video} is present in the data."
             )
 
-        # ── 4. Assign stimulus category labels ────────────────────────────────
-        #
-        # TODO: Replace `mock_labels` with your real per-trial label array.
-        #
-        # Your label array must be shape (n_valid,) with integer codes, e.g.:
-        #   1 = color stimulus
-        #   2 = shape stimulus
-        #   3 = face  stimulus
-        #
-        # Typical workflow:
-        #   behav_log   = pd.read_csv("walk_behavioural_log.csv")
-        #   # The log should have one row per photodiode flash during the video.
-        #   # Align by trial index (assumes log rows correspond 1:1 to valid events):
-        #   real_labels = behav_log["category_code"].values.astype(np.int32)
-        #   assert len(real_labels) == n_valid, "Log/event count mismatch!"
 
+        # we've wateched the video and wrote down every event that happened during a white signal in the left down corner
+        # we got 126 events: color, shape or face. this array represent them sequentially
+        # array is used to train a model that we'll later use for analyzing Walk.mat and Unicorn data that we've got
         real_labels = np.array([
             1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 2, 2, 2, 2, 1, 2, 2, 1, 1, 1,
             3, 3, 3, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1, 1,
@@ -562,30 +448,20 @@ class ECoGProcessor(SignalProcessor):
         log.info("  Using real behavioural labels (%d events, classes: %s)",
                  n_valid, np.unique(labels).tolist())
       
-        # ── 5. Build the MNE events array: shape (n_events, 3) ───────────────
-        # MNE convention: col0=sample_index, col1=prev_event_id (0), col2=event_id
+        #  MNE events array
+        # col0=sample_index, col1=prev_event_id (0), col2=event_id
         events = np.column_stack([
             valid_samples.astype(np.int32),
-            np.zeros(n_valid, dtype=np.int32),   # always 0 (MNE convention)
+            np.zeros(n_valid, dtype=np.int32), # always zero
             labels,
         ])
 
-        # ── 6. Map integer codes to human-readable names ──────────────────────
         unique_codes = np.unique(labels)
-        # These names are placeholders — update once real labels are injected.
-        # TODO: Replace with your actual class name mapping once real labels are used.
-        placeholder_names = {1: "class_1", 2: "class_2", 3: "class_3"}
+        placeholder_names = {1: "color", 2: "shape", 3: "face"}
         event_id = {placeholder_names.get(c, f"stim_{c}"): int(c) for c in unique_codes}
         log.info("  Event IDs: %s", event_id)
 
-        # ── 7. Epoch around each event ────────────────────────────────────────
-        # preload=False: MNE stores only the event table in RAM; the (n_epochs ×
-        # 160 ch × 1441 samples) tensor (~800 MB at float32) is NEVER materialised
-        # — it is streamed in chunks inside _build_features().
-
-        # Build the reject dict only when a threshold is configured.
-        # MNE expects amplitudes in Volts; EpochConfig stores µV, so divide by 1e6.
-        # Passing reject=None disables rejection entirely (MNE default behaviour).
+        # epoch around each event
         reject_threshold = (
             {"ecog": self.epoch_cfg.reject_peak_pv * 1e-6}
             if self.epoch_cfg.reject_peak_pv is not None
@@ -611,7 +487,7 @@ class ECoGProcessor(SignalProcessor):
             tmax=self.epoch_cfg.tmax,
             baseline=self.epoch_cfg.baseline,
             picks=mne.pick_types(raw.info, ecog=True),
-            preload=False,          # ← CRITICAL: no full tensor in RAM
+            preload=False, 
             reject=reject_threshold,
             reject_by_annotation=True,
             verbose=False,
@@ -620,28 +496,21 @@ class ECoGProcessor(SignalProcessor):
 
 
 # =============================================================================
-# 3. Unicorn Hybrid Black Processor
+# Unicorn Hybrid Black Processor
 # =============================================================================
 
 class UnicornProcessor(SignalProcessor):
     """
-    Preprocessing pipeline for 8-channel consumer EEG (Unicorn Hybrid Black).
-
-    Single-file mode  : ``run(path)``                — legacy, kept for compat
-    Multi-file mode   : ``run_multi_file(files, ...)`` — used for the 6-CSV experiment
-
-    Pipeline order (per file):
-      load → bandpass (Alpha+Beta: 8–30 Hz) → epoch from ECoG flash times → features
-
-    No CAR: with only 8 channels, CAR over-suppresses genuine signals.
+    pipeline order per file)
+      load -> bandpass (Alpha+Beta: 8–30 Hz) -> epoch from ECoG flash times -> features
     """
 
     def __init__(self, epoch_cfg: EpochConfig, unicorn_cfg: UnicornConfig):
         super().__init__(epoch_cfg)
         self.cfg = unicorn_cfg
 
-    # ── 3a. Loading ───────────────────────────────────────────────────────────
-
+    
+    # loading
     def load_raw(self, path: Path) -> mne.io.BaseRaw:
         suffix = path.suffix.lower()
         if suffix == ".csv":
@@ -654,12 +523,6 @@ class UnicornProcessor(SignalProcessor):
             )
 
     def _load_csv(self, path: Path) -> mne.io.BaseRaw:
-        """
-        Parse a Unicorn Suite CSV export.
-        Expected columns: channel names as header, last column = Trigger.
-        Unicorn exports µV-scaled EEG; converted to Volts for MNE.
-        numpy.loadtxt is C-backed and streams from disk — modest RAM usage.
-        """
         import csv
 
         log.info("  Reading CSV header …")
@@ -680,8 +543,8 @@ class UnicornProcessor(SignalProcessor):
         )   # (n_samples, n_cols)
 
         eeg_indices = [header.index(c) for c in eeg_cols]
-        n_ch     = len(self.cfg.channel_names)         # 8 — the channels we actually want
-        eeg_data = raw_csv[:, eeg_indices[:n_ch]].T * 1e-6   # (8, T) — drop the 9th column
+        n_ch     = len(self.cfg.channel_names)
+        eeg_data = raw_csv[:, eeg_indices[:n_ch]].T * 1e-6
         log.info(
             "  CSV has %d non-trigger columns; using first %d as EEG (%s …)",
             len(eeg_indices), n_ch, eeg_cols[n_ch - 1],
@@ -728,13 +591,9 @@ class UnicornProcessor(SignalProcessor):
         )
         return mne.io.RawArray(data, info, verbose=False)
 
-    # ── 3b. Preprocessing ─────────────────────────────────────────────────────
-
+    # preprocessing
     def preprocess(self) -> mne.io.BaseRaw:
-        """
-        Butterworth bandpass filter (Alpha + Beta: 8–30 Hz), zero-phase.
-        Applied channel-by-channel to keep peak RAM at O(one channel).
-        """
+
         sfreq     = self._raw.info["sfreq"]
         low, high = self.cfg.ab_band
         nyq       = sfreq / 2.0
@@ -756,8 +615,7 @@ class UnicornProcessor(SignalProcessor):
         gc.collect()
         return self._raw
 
-    # ── 3c. Epoch from pre-computed flash times ───────────────────────────────
-
+    # epoch from pre-computed flash times
     def _epoch_from_flash_seconds(
         self,
         raw: mne.io.BaseRaw,
@@ -766,18 +624,8 @@ class UnicornProcessor(SignalProcessor):
         label_map: dict,
     ) -> mne.Epochs:
         """
-        Build an MNE Epochs object from absolute flash onset times (seconds).
-
-        Unlike the ECoG path (which detects onsets from the photodiode), Unicorn
-        CSVs have no trigger channel.  Instead we project the ECoG-derived onset
-        times into Unicorn sample space:
-
-            unicorn_sample = round(flash_second * unicorn_sfreq)
-
-        Parameters
-        ----------
         raw           : filtered Unicorn RawArray
-        flash_seconds : (n_trials,) onset times in seconds, already offset-corrected
+        flash_seconds : (n_trials,) onset times in seconds
         labels        : (n_trials,) integer class codes  (1=color, 2=shape, 3=face)
         label_map     : {int: str} for MNE event_id  (e.g. {1:"color", 2:"shape",...})
         """
@@ -786,7 +634,7 @@ class UnicornProcessor(SignalProcessor):
 
         flash_samples = np.round(flash_seconds * sfreq).astype(np.int32)
 
-        # Guard: discard any events that would fall outside the recording
+        # discard any events that fall outside the recording
         tmin_samp = int(np.round(self.epoch_cfg.tmin * sfreq))   # negative offset
         tmax_samp = int(np.round(self.epoch_cfg.tmax * sfreq))
 
@@ -823,26 +671,24 @@ class UnicornProcessor(SignalProcessor):
             tmax=self.epoch_cfg.tmax,
             baseline=self.epoch_cfg.baseline,
             picks=mne.pick_types(raw.info, eeg=True),
-            preload=False,   # lazy — stream in _build_features chunks
+            preload=False, 
             verbose=False,
         )
         return epochs
 
-    # ── 3d. Single-file run (legacy) ──────────────────────────────────────────
 
     def run(self, path: Path) -> Tuple[np.ndarray, np.ndarray]:
         """Legacy single-file run — kept for backward compatibility."""
         log.info("[UnicornProcessor] Loading: %s", path.name)
         self._raw = self.load_raw(path)
         self._raw = self.preprocess()
-        epochs    = self.extract_epochs()   # uses STI014 trigger channel
+        epochs    = self.extract_epochs() 
         X, y      = self._build_features(epochs)
         del epochs, self._raw
         self._raw = None
         gc.collect()
         return X, y
 
-    # ── 3e. Multi-file run (6-CSV experiment) ─────────────────────────────────
 
     def run_multi_file(
         self,
@@ -852,28 +698,15 @@ class UnicornProcessor(SignalProcessor):
         label_map:           dict,           # {1: "color", 2: "shape", 3: "face"}
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Iterate over multiple Unicorn CSV files, epoch each using ECoG-derived
-        flash times (shifted by the file's video-start offset), extract features,
-        then concatenate across files.
-
-        Memory model (M3 · 8 GB)
-        -------------------------
-        Each CSV: ~250 Hz × ~300 s × 8 ch × 4 B ≈ 2.4 MB — negligible.
-        Epoch tensor per file: 126 epochs × 8 ch × 301 samples × 4 B ≈ 1.2 MB.
-        Feature matrix per file: (126, 8) × 4 B ≈ 4 KB.
-        Peak usage is dominated by the filtered Raw, freed after each iteration.
-
         Parameters
-        ----------
-        unicorn_files       : list of (Path, float) — file path + video-start offset
-        ecog_flash_seconds  : absolute flash times from ECoG (t=0 is ECoG recording start)
+        unicorn_files       : list of (Path, float), file path + video-start offset
+        ecog_flash_seconds  : absolute flash times from ECoG
         real_labels         : (n_trials,) — same 126 labels used for ECoG
-        label_map           : {int: str} — class code → human label
+        label_map           : {int: str} — class code
 
         Returns
-        -------
-        X_total : (n_files × n_trials, 8)   e.g. (756, 8)
-        y_total : (n_files × n_trials,)     e.g. (756,)
+        X_total : (n_files × n_trials, 8)
+        y_total : (n_files × n_trials,)
         """
         X_parts, y_parts = [], []
 
@@ -884,29 +717,23 @@ class UnicornProcessor(SignalProcessor):
                 file_idx, len(unicorn_files), csv_path.name, offset,
             )
 
-            # ── Load ──────────────────────────────────────────────────────────
+            # load
             self._raw = self.load_raw(csv_path)
 
-            # ── Bandpass ──────────────────────────────────────────────────────
+            # bandpass
             self._raw = self.preprocess()
 
-            # ── Shift flash times into this file's time axis ──────────────────
-            # ECoG times are relative to ECoG t=0.  The video started at
-            # `offset` seconds into this Unicorn file, so flash times measured
-            # from Unicorn t=0 are:
-            #   unicorn_flash = ecog_flash_seconds + offset
             unicorn_flash_seconds = ecog_flash_seconds + offset
             log.info(
                 "  Flash window in Unicorn time: %.2f – %.2f s",
                 unicorn_flash_seconds[0], unicorn_flash_seconds[-1],
             )
 
-            # ── Epoch ─────────────────────────────────────────────────────────
+            # epoch
             epochs = self._epoch_from_flash_seconds(
                 self._raw, unicorn_flash_seconds, real_labels, label_map
             )
 
-            # ── Feature extraction (chunked, OOM-safe) ─────────────────────────
             log.info("  Extracting features (chunk_size=%d) …", self.epoch_cfg.chunk_size)
             X_file, y_file = self._build_features(epochs)
             log.info("  File features: X=%s  y=%s", X_file.shape, y_file.shape)
@@ -914,12 +741,10 @@ class UnicornProcessor(SignalProcessor):
             X_parts.append(X_file)
             y_parts.append(y_file)
 
-            # ── Explicit cleanup — free filtered Raw + epoch table ─────────────
             del epochs, self._raw, unicorn_flash_seconds
             self._raw = None
             gc.collect()
 
-        # ── Concatenate across all files ──────────────────────────────────────
         X_total = np.concatenate(X_parts, axis=0)   # (n_files × 126, 8)
         y_total = np.concatenate(y_parts, axis=0)   # (n_files × 126,)
         del X_parts, y_parts
@@ -931,8 +756,6 @@ class UnicornProcessor(SignalProcessor):
             X_total.shape, y_total.shape, np.unique(y_total).tolist(),
         )
         return X_total, y_total
-
-    # ── 3f. Legacy extract_epochs (STI014-based, kept for completeness) ───────
 
     def extract_epochs(self) -> mne.Epochs:
         """Legacy trigger-channel epoching — used only by single-file ``run()``."""
@@ -958,26 +781,12 @@ class UnicornProcessor(SignalProcessor):
             preload=False,
             verbose=False,
         )
+
 # =============================================================================
-# 4. Machine Learning Pipeline
+# Machine Learning Part
 # =============================================================================
 
 class BCIClassifier:
-    """
-    sklearn-based classifier wrapper.
-
-    Two estimators are compared:
-      • RandomForestClassifier  — robust to feature scale, no tuning needed
-      • SVC (RBF kernel)        — strong on small EEG/ECoG feature sets; needs
-                                  feature scaling → included in the Pipeline
-
-    Both are wrapped in a ``sklearn.pipeline.Pipeline`` to guarantee that the
-    StandardScaler is fit only on training folds (preventing data leakage).
-
-    Cross-validation: StratifiedKFold ensures each fold has the same class
-    ratio as the full dataset — essential when class counts are unequal across
-    visual stimuli.
-    """
 
     def __init__(
         self,
@@ -999,7 +808,7 @@ class BCIClassifier:
                     n_estimators=200,
                     max_depth=None,
                     min_samples_leaf=2,
-                    class_weight="balanced",   # ← compensates 56/53/17 imbalance
+                    class_weight="balanced",   # to compensate lack of "face" in the training data from video
                     n_jobs=self.n_jobs,
                     random_state=self.random_state,
                 )),
@@ -1010,7 +819,7 @@ class BCIClassifier:
                     kernel="rbf",
                     C=1.0,
                     gamma="scale",
-                    class_weight="balanced",   # ← already present, kept
+                    class_weight="balanced",
                     random_state=self.random_state,
                     decision_function_shape="ovr",
                 )),
@@ -1024,17 +833,12 @@ class BCIClassifier:
         label_names: Optional[dict] = None,
     ) -> dict:
         """
-        Run StratifiedKFold cross-validation for all classifiers and return
-        a structured results dictionary.
-
         Parameters
-        ----------
         X : (n_epochs, n_features)
         y : (n_epochs,) — integer class labels
-        label_names : {int: str} mapping for confusion matrix display (optional)
+        label_names : {int: str} mapping for confusion matrix display
 
         Returns
-        -------
         results : dict keyed by classifier name with metrics sub-dicts
         """
         y_enc = self.le.fit_transform(y)
@@ -1053,7 +857,7 @@ class BCIClassifier:
                 return_train_score=False,
                 n_jobs=self.n_jobs,
             )
-            # Final fit on all data for the confusion matrix
+            # final fit on all data for the confusion matrix
             pipe.fit(X, y_enc)
             y_pred = pipe.predict(X)
 
@@ -1093,21 +897,10 @@ class BCIClassifier:
 
 
 # =============================================================================
-# 5. Comparative BCI Experiment Orchestrator
+#  BCI Experiment
 # =============================================================================
 
 class BCIExperiment:
-    """
-    High-level coordinator that runs both modality pipelines and compares
-    classifier performance.
-
-    Usage
-    -----
-    >>> exp = BCIExperiment(epoch_cfg, ecog_cfg, unicorn_cfg)
-    >>> exp.run(ecog_mat_path=Path("ecog_recording.mat"),
-    ...         unicorn_csv_path=Path("unicorn_session.csv"),
-    ...         label_map={1: "color", 2: "shape", 3: "face"})
-    """
 
     def __init__(
         self,
@@ -1130,22 +923,17 @@ class BCIExperiment:
         Execute both pipelines and return a dict with all metrics.
 
         Parameters
-        ----------
-        ecog_mat_path : Path to Walk.mat  (None = skip ECoG pipeline)
+        ecog_mat_path : Path to Walk.mat
         unicorn_files : list of (Path, float) tuples — CSV path + video-start offset
-                        e.g. [("rec1.csv", 0.0), ("rec3.csv", 15.0), ...]
-                        None = skip Unicorn pipeline
         label_map     : {int: str}  e.g. {1: "color", 2: "shape", 3: "face"}
         """
         all_results      = {}
         ecog_flash_secs  = None   # set below; passed into Unicorn pipeline
 
-        # ── ECoG pipeline ─────────────────────────────────────────────────────
         if ecog_mat_path is not None:
             log.info("=== ECoG Pipeline ===")
             X_ecog, y_ecog = self.ecog_proc.run(ecog_mat_path)
 
-            # Flash times are now available as a side-effect of ECoGProcessor.run()
             ecog_flash_secs = self.ecog_proc.ecog_flash_seconds
             log.info(
                 "  ECoG flash times exposed: %d events  (%.2f – %.2f s)",
@@ -1158,7 +946,7 @@ class BCIExperiment:
             del X_ecog, y_ecog
             gc.collect()
 
-        # ── Unicorn multi-file pipeline ────────────────────────────────────────
+        # Unicorn multi-file pipeline
         if unicorn_files is not None:
             if ecog_flash_secs is None:
                 raise RuntimeError(
@@ -1169,7 +957,7 @@ class BCIExperiment:
 
             log.info("=== Unicorn EEG Pipeline (%d files) ===", len(unicorn_files))
 
-            # The same 126-trial label sequence applies to every file
+            # The same dataset of 126 numbers we've used before
             real_labels = np.array([
                 1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 2, 2, 2, 2, 1, 2, 2, 1, 1, 1,
                 3, 3, 3, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1, 1,
@@ -1217,15 +1005,11 @@ class BCIExperiment:
             )
 
 
-# =============================================================================
-# 6. Entry point
-# =============================================================================
 
 if __name__ == "__main__":
     import argparse
     from pathlib import Path
 
-    # ── CLI — accept paths as arguments or fall back to hardcoded defaults ────
     parser = argparse.ArgumentParser(
         description="BCI Dual-Pipeline: ECoG (Walk.mat) vs Unicorn EEG"
     )
@@ -1259,11 +1043,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # ── Hardcoded fallback paths — edit these for your local environment ──────
-    # These are used only when the script is run without CLI arguments, e.g.
-    # from an IDE or Jupyter %run magic.
+
     ECOG_PATH    = args.ecog    or Path("ecog-video/Walk.mat")
-    UNICORN_PATH = args.unicorn or None   # set to Path("unicorn_session.csv") if available
+    UNICORN_PATH = args.unicorn or None 
 
     log.info("BCI Dual-Pipeline — Clinical ECoG Run (Walk.mat)")
     log.info("ECoG path    : %s", ECOG_PATH)
@@ -1275,18 +1057,14 @@ if __name__ == "__main__":
             "Pass the correct path with: python bci_pipeline.py --ecog /path/to/Walk.mat"
         )
 
-    # ── Configuration ─────────────────────────────────────────────────────────
     epoch_cfg = EpochConfig(
         tmin=-0.2,
         tmax=1.0,
         baseline=(-0.2, 0.0),
-        # chunk_size=16 → each chunk = 16 epochs × 160 ch × 1441 samples × 4 B ≈ 148 MB
-        # Increase to 32 if RAM allows; decrease to 8 if you hit OOM.
         chunk_size=args.chunk_size,
     )
 
     ecog_cfg = ECoGConfig(
-        # All defaults match Walk.mat spec; override here if your file differs.
         sfreq_expected    = 1200.0,
         mat_variable      = "y",
         n_ecog_channels   = 160,
@@ -1308,12 +1086,8 @@ if __name__ == "__main__":
         butter_order = 4,
     )
 
-    # ── Label map (placeholder — update once real labels are injected) ─────────
-    # TODO: Replace with your actual stimulus category mapping once the
-    #       behavioural log is wired into extract_epochs().
     label_map = {1: "color", 2: "shape", 3: "face"}
 
-# ── Unicorn file list (offset = seconds from Unicorn t=0 to video start) ──
     UNICORN_DIR   = Path("unicorn")
     unicorn_files = [
         (UNICORN_DIR / "1/1RAW.csv",  0.0),
@@ -1323,8 +1097,7 @@ if __name__ == "__main__":
         (UNICORN_DIR / "5/5RAW.csv", 15.0),
         (UNICORN_DIR / "6/6RAW.csv", 15.0),
     ]
-    # Filter to files that actually exist — allows partial runs during dev,
-    # but any missing file is logged explicitly so incomplete datasets are visible.
+
     _expected_unicorn_files = unicorn_files
     unicorn_files = [(p, o) for p, o in _expected_unicorn_files if Path(p).exists()]
 
@@ -1342,7 +1115,6 @@ if __name__ == "__main__":
         log.warning("No Unicorn CSV files found in %s — skipping Unicorn pipeline.", UNICORN_DIR)
         unicorn_files = None
 
-    # ── Run experiment ────────────────────────────────────────────────────────
     experiment = BCIExperiment(
         epoch_cfg   = epoch_cfg,
         ecog_cfg    = ecog_cfg,
