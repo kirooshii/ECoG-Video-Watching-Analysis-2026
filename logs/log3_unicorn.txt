@@ -1,0 +1,196 @@
+23:25:28 [INFO] bci_pipeline – BCI Dual-Pipeline — Clinical ECoG Run (Walk.mat)
+23:25:28 [INFO] bci_pipeline – Target: Apple M3 · 8 GB unified memory — OOM-safe mode
+23:25:28 [INFO] bci_pipeline – ECoG path    : ecog-video/Walk.mat
+23:25:28 [INFO] bci_pipeline – Unicorn path : <not provided — skipping Unicorn pipeline>
+23:25:28 [INFO] bci_pipeline – === ECoG Pipeline ===
+23:25:28 [INFO] bci_pipeline – [ECoGProcessor] Loading: Walk.mat
+23:25:28 [INFO] bci_pipeline –   scipy.io.loadmat('Walk.mat', variable_names=['y']) …
+23:25:29 [INFO] bci_pipeline –   Raw matrix shape: (322049, 164)  dtype: float32
+23:25:29 [INFO] bci_pipeline –   Slicing 100 ROI channels 61–160, Photodiode [161], StimCode [162] …
+23:25:29 [INFO] bci_pipeline –   Original matrix freed.  ROI ECoG array: (100, 322049)  (128.8 MB)
+23:25:30 [INFO] bci_pipeline –   RawArray ready: 160 ECoG ch + Photodiode + StimCode  |  268.4 s @ 1200 Hz
+23:25:30 [INFO] bci_pipeline – [ECoGProcessor] Preprocessing …
+23:25:30 [INFO] bci_pipeline –   Applying notch filters at: [50.0, 100.0, 150.0] Hz
+23:25:31 [INFO] bci_pipeline –   Applying Common Average Reference (CAR) …
+23:25:31 [INFO] bci_pipeline –   Computing High-Gamma (70–150 Hz) envelope …
+23:25:37 [INFO] bci_pipeline – [ECoGProcessor] Extracting epochs …
+23:25:37 [INFO] bci_pipeline –   Photodiode: 126 total rising edges detected
+23:25:37 [INFO] bci_pipeline –   StimCode gate (==2): kept 126 / 126  (dropped 0 outside video)
+23:25:37 [INFO] bci_pipeline –   Using real behavioural labels (126 events, classes: [1, 2, 3])
+23:25:37 [INFO] bci_pipeline –   Event IDs: {'class_1': 1, 'class_2': 2, 'class_3': 3}
+23:25:37 [INFO] bci_pipeline – [ECoGProcessor] Flash times stored: 126 events, 10.45 – 260.32 s
+23:25:37 [INFO] bci_pipeline – [ECoGProcessor] Building feature matrix …
+23:25:37 [INFO] bci_pipeline – [ECoGProcessor] Done — X: (126, 100)  y: (126,)
+23:25:37 [INFO] bci_pipeline –   ECoG flash times exposed: 126 events  (10.45 – 260.32 s)
+23:25:37 [INFO] bci_pipeline –   Cross-validating: RandomForest (5 folds) …
+23:25:38 [INFO] bci_pipeline –   Cross-validating: SVM_RBF (5 folds) …
+/Users/kir/Documents/Code/brain/.venv/lib/python3.13/site-packages/sklearn/metrics/_classification.py:1833: UndefinedMetricWarning: Precision is ill-defined and being set to 0.0 in labels with no predicted samples. Use `zero_division` parameter to control this behavior.
+  _warn_prf(average, modifier, f"{metric.capitalize()} is", result.shape[0])
+============================================================
+  ECoG (intracranial) — Classification Results
+============================================================
+
+── RandomForest ──────────────────────────────
+  CV Accuracy : 0.6655 ± 0.0956
+  Precision   : 0.7044
+  Recall      : 0.6586
+  F1 (macro)  : 0.6664
+
+  Classification Report (full-data fit):
+              precision    recall  f1-score   support
+
+       color       1.00      1.00      1.00        56
+       shape       1.00      1.00      1.00        53
+        face       1.00      1.00      1.00        17
+
+    accuracy                           1.00       126
+   macro avg       1.00      1.00      1.00       126
+weighted avg       1.00      1.00      1.00       126
+
+  Confusion Matrix:
+[[56  0  0]
+ [ 0 53  0]
+ [ 0  0 17]]
+
+── SVM_RBF ──────────────────────────────
+  CV Accuracy : 0.6108 ± 0.0488
+  Precision   : 0.6343
+  Recall      : 0.5347
+  F1 (macro)  : 0.5516
+
+  Classification Report (full-data fit):
+              precision    recall  f1-score   support
+
+       color       0.94      0.91      0.93        56
+       shape       0.91      0.94      0.93        53
+        face       1.00      1.00      1.00        17
+
+    accuracy                           0.94       126
+   macro avg       0.95      0.95      0.95       126
+weighted avg       0.94      0.94      0.94       126
+
+  Confusion Matrix:
+[[51  5  0]
+ [ 3 50  0]
+ [ 0  0 17]]
+23:25:39 [INFO] bci_pipeline – === Unicorn EEG Pipeline (6 files) ===
+23:25:39 [INFO] bci_pipeline – [UnicornProcessor] File 1/6 — 1RAW.csv  (offset=0.0 s)
+23:25:39 [INFO] bci_pipeline –   Reading CSV header …
+23:25:39 [INFO] bci_pipeline –   Loading CSV data (streaming via numpy) …
+23:25:39 [INFO] bci_pipeline –   CSV has 9 non-trigger columns; using first 8 as EEG ( EEG 8 …)
+23:25:39 [INFO] bci_pipeline –   Bandpass filter: 8.0–30.0 Hz (Butterworth order 4) …
+23:25:39 [INFO] bci_pipeline –   Flash window in Unicorn time: 10.45 – 260.32 s
+23:25:39 [WARNING] bci_pipeline –   Dropped 5 events outside recording bounds (offset may push early flashes before t=0 or beyond EOF).
+23:25:39 [INFO] bci_pipeline –   Built 121 epochs from flash times  |  event_id: {'color': 1, 'shape': 2, 'face': 3}
+23:25:39 [INFO] bci_pipeline –   Extracting features (chunk_size=16) …
+23:25:39 [INFO] bci_pipeline –   File features: X=(121, 8)  y=(121,)
+23:25:39 [INFO] bci_pipeline – [UnicornProcessor] File 2/6 — 2RAW.csv  (offset=0.0 s)
+23:25:39 [INFO] bci_pipeline –   Reading CSV header …
+23:25:39 [INFO] bci_pipeline –   Loading CSV data (streaming via numpy) …
+23:25:39 [INFO] bci_pipeline –   CSV has 9 non-trigger columns; using first 8 as EEG ( EEG 8 …)
+23:25:39 [INFO] bci_pipeline –   Bandpass filter: 8.0–30.0 Hz (Butterworth order 4) …
+23:25:39 [INFO] bci_pipeline –   Flash window in Unicorn time: 10.45 – 260.32 s
+23:25:39 [WARNING] bci_pipeline –   Dropped 5 events outside recording bounds (offset may push early flashes before t=0 or beyond EOF).
+23:25:39 [INFO] bci_pipeline –   Built 121 epochs from flash times  |  event_id: {'color': 1, 'shape': 2, 'face': 3}
+23:25:39 [INFO] bci_pipeline –   Extracting features (chunk_size=16) …
+23:25:39 [INFO] bci_pipeline –   File features: X=(121, 8)  y=(121,)
+23:25:39 [INFO] bci_pipeline – [UnicornProcessor] File 3/6 — 3RAW.csv  (offset=15.0 s)
+23:25:39 [INFO] bci_pipeline –   Reading CSV header …
+23:25:39 [INFO] bci_pipeline –   Loading CSV data (streaming via numpy) …
+23:25:39 [INFO] bci_pipeline –   CSV has 9 non-trigger columns; using first 8 as EEG ( EEG 8 …)
+23:25:39 [INFO] bci_pipeline –   Bandpass filter: 8.0–30.0 Hz (Butterworth order 4) …
+23:25:39 [INFO] bci_pipeline –   Flash window in Unicorn time: 25.45 – 275.32 s
+23:25:39 [WARNING] bci_pipeline –   Dropped 4 events outside recording bounds (offset may push early flashes before t=0 or beyond EOF).
+23:25:39 [INFO] bci_pipeline –   Built 122 epochs from flash times  |  event_id: {'color': 1, 'shape': 2, 'face': 3}
+23:25:39 [INFO] bci_pipeline –   Extracting features (chunk_size=16) …
+23:25:40 [INFO] bci_pipeline –   File features: X=(122, 8)  y=(122,)
+23:25:40 [INFO] bci_pipeline – [UnicornProcessor] File 4/6 — 4RAW.csv  (offset=15.0 s)
+23:25:40 [INFO] bci_pipeline –   Reading CSV header …
+23:25:40 [INFO] bci_pipeline –   Loading CSV data (streaming via numpy) …
+23:25:40 [INFO] bci_pipeline –   CSV has 9 non-trigger columns; using first 8 as EEG ( EEG 8 …)
+23:25:40 [INFO] bci_pipeline –   Bandpass filter: 8.0–30.0 Hz (Butterworth order 4) …
+23:25:40 [INFO] bci_pipeline –   Flash window in Unicorn time: 25.45 – 275.32 s
+23:25:40 [WARNING] bci_pipeline –   Dropped 4 events outside recording bounds (offset may push early flashes before t=0 or beyond EOF).
+23:25:40 [INFO] bci_pipeline –   Built 122 epochs from flash times  |  event_id: {'color': 1, 'shape': 2, 'face': 3}
+23:25:40 [INFO] bci_pipeline –   Extracting features (chunk_size=16) …
+23:25:40 [INFO] bci_pipeline –   File features: X=(122, 8)  y=(122,)
+23:25:40 [INFO] bci_pipeline – [UnicornProcessor] File 5/6 — 5RAW.csv  (offset=15.0 s)
+23:25:40 [INFO] bci_pipeline –   Reading CSV header …
+23:25:40 [INFO] bci_pipeline –   Loading CSV data (streaming via numpy) …
+23:25:40 [INFO] bci_pipeline –   CSV has 9 non-trigger columns; using first 8 as EEG ( EEG 8 …)
+23:25:40 [INFO] bci_pipeline –   Bandpass filter: 8.0–30.0 Hz (Butterworth order 4) …
+23:25:40 [INFO] bci_pipeline –   Flash window in Unicorn time: 25.45 – 275.32 s
+23:25:40 [WARNING] bci_pipeline –   Dropped 4 events outside recording bounds (offset may push early flashes before t=0 or beyond EOF).
+23:25:40 [INFO] bci_pipeline –   Built 122 epochs from flash times  |  event_id: {'color': 1, 'shape': 2, 'face': 3}
+23:25:40 [INFO] bci_pipeline –   Extracting features (chunk_size=16) …
+23:25:40 [INFO] bci_pipeline –   File features: X=(122, 8)  y=(122,)
+23:25:40 [INFO] bci_pipeline – [UnicornProcessor] File 6/6 — 6RAW.csv  (offset=15.0 s)
+23:25:40 [INFO] bci_pipeline –   Reading CSV header …
+23:25:40 [INFO] bci_pipeline –   Loading CSV data (streaming via numpy) …
+23:25:40 [INFO] bci_pipeline –   CSV has 9 non-trigger columns; using first 8 as EEG ( EEG 8 …)
+23:25:40 [INFO] bci_pipeline –   Bandpass filter: 8.0–30.0 Hz (Butterworth order 4) …
+23:25:40 [INFO] bci_pipeline –   Flash window in Unicorn time: 25.45 – 275.32 s
+23:25:40 [WARNING] bci_pipeline –   Dropped 4 events outside recording bounds (offset may push early flashes before t=0 or beyond EOF).
+23:25:40 [INFO] bci_pipeline –   Built 122 epochs from flash times  |  event_id: {'color': 1, 'shape': 2, 'face': 3}
+23:25:40 [INFO] bci_pipeline –   Extracting features (chunk_size=16) …
+23:25:40 [INFO] bci_pipeline –   File features: X=(122, 8)  y=(122,)
+23:25:40 [INFO] bci_pipeline – [UnicornProcessor] Multi-file complete — X_total: (730, 8)  y_total: (730,)  classes: [1, 2, 3]
+23:25:40 [INFO] bci_pipeline –   Concatenated dataset — X: (730, 8)  y: (730,)  class distribution: {1: 336, 2: 316, 3: 78}
+23:25:40 [INFO] bci_pipeline –   Cross-validating: RandomForest (5 folds) …
+/Users/kir/Documents/Code/brain/.venv/lib/python3.13/site-packages/sklearn/metrics/_classification.py:1833: UndefinedMetricWarning: Precision is ill-defined and being set to 0.0 in labels with no predicted samples. Use `zero_division` parameter to control this behavior.
+  _warn_prf(average, modifier, f"{metric.capitalize()} is", result.shape[0])
+23:25:41 [INFO] bci_pipeline –   Cross-validating: SVM_RBF (5 folds) …
+============================================================
+  Unicorn EEG (scalp, 6-file) — Classification Results
+============================================================
+
+── RandomForest ──────────────────────────────
+  CV Accuracy : 0.4370 ± 0.0386
+  Precision   : 0.3114
+  Recall      : 0.3289
+  F1 (macro)  : 0.3153
+
+  Classification Report (full-data fit):
+              precision    recall  f1-score   support
+
+       color       1.00      0.99      1.00       336
+       shape       0.99      1.00      1.00       316
+        face       1.00      1.00      1.00        78
+
+    accuracy                           1.00       730
+   macro avg       1.00      1.00      1.00       730
+weighted avg       1.00      1.00      1.00       730
+
+  Confusion Matrix:
+[[334   2   0]
+ [  1 315   0]
+ [  0   0  78]]
+
+── SVM_RBF ──────────────────────────────
+  CV Accuracy : 0.1534 ± 0.0305
+  Precision   : 0.5619
+  Recall      : 0.3610
+  F1 (macro)  : 0.1312
+
+  Classification Report (full-data fit):
+              precision    recall  f1-score   support
+
+       color       0.65      0.07      0.13       336
+       shape       0.83      0.03      0.06       316
+        face       0.11      0.97      0.20        78
+
+    accuracy                           0.15       730
+   macro avg       0.53      0.36      0.13       730
+weighted avg       0.67      0.15      0.11       730
+
+  Confusion Matrix:
+[[ 24   2 310]
+ [ 11  10 295]
+ [  2   0  76]]
+
+============================================================
+  MODALITY COMPARISON (RandomForest, CV-Accuracy)
+============================================================
+  ECoG          RF: 0.6655±0.0956   SVM: 0.6108±0.0488
+  Unicorn       RF: 0.4370±0.0386   SVM: 0.1534±0.0305
+23:25:41 [INFO] bci_pipeline – Pipeline complete.
