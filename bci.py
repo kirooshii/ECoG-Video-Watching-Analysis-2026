@@ -1,23 +1,14 @@
 """
 "ECoG Video Watching Analysis" by Horizons team
-Horizons are:
-Tobias Fleitas,
-Makar Lavrov
+Team Number: G114
 
-DSP conventions
----------------
-* All filters are zero-phase (filtfilt / MNE forward–backward) to avoid
-  group-delay artefacts that would shift neural response latency.
-* Notch filter Q=30 -> bandwidth ≈ powerline_freq/30 ≈ 1.67 Hz @50 Hz —
-  narrow enough to preserve broadband signal, wide enough to kill harmonics.
-* CAR (Common Average Reference) approximates a Laplacian on dense arrays
-  and suppresses common-mode noise. Applied AFTER notch to avoid referencing
-  noise back in.
-* High-Gamma envelope: bandpass FIR (zero-phase, Kaiser window) -> |Hilbert|.
-  The Hilbert approach preserves instantaneous amplitude modulation; a simple
-  power-of-filtered-signal would introduce rectification artefacts.
-* Epoching baseline: −0.2 s is long enough to estimate a pre-stimulus mean
-  without aliasing the next trial's offset for stimuli presented ≥800 ms apart.
+Horizons are:
+- Tobias Fleitas tobias.montiel.1@iliauni.edu.ge,
+- Makar Lavrov makar.lavrov.1@iliauni.edu.ge
+
+ISU, Tbilisi
+
+26.04.2026
 """
 
 from __future__ import annotations
