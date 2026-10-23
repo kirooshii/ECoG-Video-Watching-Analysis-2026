@@ -3,7 +3,7 @@
 Team Number: G114
 
 Horizons are:
-- Tobias Fleitas tobias.montiel.1@iliauni.edu.ge,
+- Tobías Ezequiel Fleitas Montiel tobias.montiel.1@iliauni.edu.ge,
 - Makar Lavrov makar.lavrov.1@iliauni.edu.ge
 
 ISU, Tbilisi
@@ -1045,7 +1045,7 @@ if __name__ == "__main__":
     if not ECOG_PATH.exists():
         raise FileNotFoundError(
             f"Walk.mat not found at: {ECOG_PATH.resolve()}\n"
-            "Pass the correct path with: python bci_pipeline.py --ecog /path/to/Walk.mat"
+            "Pass the correct path with: python bci.py --ecog /path/to/Walk.mat"
         )
 
     epoch_cfg = EpochConfig(

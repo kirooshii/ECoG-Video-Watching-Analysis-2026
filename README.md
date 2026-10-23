@@ -66,8 +66,8 @@ Raw recording file
 - Only the posterior 100 channels (visual/temporal cortex) are used, the frontal 60 are excluded because of the noise (accuracy is much lower because of the muscle movements)
 
 **Unicorn EEG** (scalp, portable):
-- Bandpass filter 1–50 Hz (4th-order Butterworth, zero-phase)
-- Alpha (8–13 Hz) and Beta (13–30 Hz) power — high-gamma is not accessible through the skull
+- Bandpass filter 8–30 Hz (4th-order Butterworth, zero-phase)
+- Alpha + Beta band power (8–30 Hz) — high-gamma is not accessible through the skull
 - Can combine multiple recording files with a per-file time offset to align with video stimulus timing
 
 ---
@@ -101,94 +101,41 @@ python -m pip install -r requirements.txt
 ## Running it
 
 ```
-python bci_pipeline.py
+python bci.py
 ```
 
-File paths and parameters are configured at the bottom of the script in the `if __name__ == "__main__"` block.
+By default this reads the ECoG recording from `ecog-video/Walk.mat` and the six Unicorn sessions from `unicorn/N/NRAW.csv`. Options:
 
-make sure to set:
+- `--ecog PATH`: path to a different `Walk.mat`
+- `--cv-splits N`: number of stratified cross-validation folds (default 5)
+- `--chunk-size N`: epochs per RAM chunk during feature extraction (default 16; lower it if you run out of memory)
 
-- `ECOG_MAT_PATH` — path to your `Walk.mat` file
-- `UNICORN_DIR` — folder containing the Unicorn CSV subdirectories
+The Unicorn file list and the per-file time offsets are set in the `if __name__ == "__main__"` block at the bottom of `bci.py`.
 
 ---
 
-## Output
-
-The pipeline prints a results table for each device and each classifier:
-
-
 # Results
 
-## ECoG Results:
+All numbers are **5-fold stratified cross-validation** (mean ± std across folds). The baseline is the accuracy of always predicting the most common class.
 
-```
-── RandomForest ──────────────────────────────
-  CV Accuracy : 0.6655 ± 0.0956
-  Precision   : 0.7044
-  Recall      : 0.6586
-  F1 (macro)  : 0.6664
+| Modality | Trials | Majority-class baseline | Random Forest | SVM (RBF) |
+|---|---|---|---|---|
+| ECoG (intracranial, 100 posterior channels) | 126 | 44.4% (56/126 "color") | **66.6% ± 9.6%** | **61.1% ± 4.9%** |
+| Unicorn EEG (scalp, 8 channels, 6 sessions) | 730 | 46.0% (336/730 "color") | 43.7% ± 3.9% | 15.3% ± 3.1% |
 
-  Classification Report (full-data fit):
-              precision    recall  f1-score   support
+Classes: color (56 / 336), shape (53 / 316), face (17 / 78) for ECoG / EEG.
 
-       color       1.00      1.00      1.00        56
-       shape       1.00      1.00      1.00        53
-        face       1.00      1.00      1.00        17
+**ECoG decodes the stimulus category.** Both classifiers beat the majority-class baseline by about 17–22 percentage points. Macro F1 is 0.67 (RF) and 0.55 (SVM).
 
-    accuracy                           1.00       126
-   macro avg       1.00      1.00      1.00       126
-weighted avg       1.00      1.00      1.00       126
+**Scalp EEG does not.** The Random Forest reaches 43.7%, slightly below the 46.0% baseline, with macro F1 0.32, about what a classifier guessing at random would get on 3 classes. With 8 dry electrodes and alpha/beta power features, nothing in the signal separates the categories.
 
-  Confusion Matrix:
-[[56  0  0]
- [ 0 53  0]
- [ 0  0 17]]
-```
+The EEG SVM's 15.3% is **below chance**, and it does not mean the SVM learned an inverted signal. Both classifiers use `class_weight="balanced"`, which weights the rare "face" class about 4× more than "color" or "shape". When the features carry no information, the cheapest way for the SVM to lower that weighted loss is to predict "face" for almost everything. Predicting "face" for every epoch would score 78/730 = 10.7%; the SVM lands just above that. Treat this result as "no signal", the same as the Random Forest.
 
-## EEG Results:
-```
-── RandomForest ──────────────────────────────
-  CV Accuracy : 0.4370 ± 0.0386
-  Precision   : 0.3114
-  Recall      : 0.3289
-  F1 (macro)  : 0.3153
+**Takeaway:** with the same stimuli and the same pipeline, invasive high-gamma activity carries enough information to tell color, shape and face stimuli apart, and consumer scalp EEG does not.
 
-  Classification Report (full-data fit):
-              precision    recall  f1-score   support
+### Notes on the numbers
 
-       color       1.00      0.99      1.00       336
-       shape       0.99      1.00      1.00       316
-        face       1.00      1.00      1.00        78
-
-    accuracy                           1.00       730
-   macro avg       1.00      1.00      1.00       730
-weighted avg       1.00      1.00      1.00       730
-
-  Confusion Matrix:
-[[334   2   0]
- [  1 315   0]
- [  0   0  78]]
-
-── SVM_RBF ──────────────────────────────
-  CV Accuracy : 0.1534 ± 0.0305
-  Precision   : 0.5619
-  Recall      : 0.3610
-  F1 (macro)  : 0.1312
-
-  Classification Report (full-data fit):
-              precision    recall  f1-score   support
-
-       color       0.65      0.07      0.13       336
-       shape       0.83      0.03      0.06       316
-        face       0.11      0.97      0.20        78
-
-    accuracy                           0.15       730
-   macro avg       0.53      0.36      0.13       730
-weighted avg       0.67      0.15      0.11       730
-
-  Confusion Matrix:
-[[ 24   2 310]
- [ 11  10 295]
- [  2   0  76]]
- ```
+- The script also prints a "Classification Report (full-data fit)" and confusion matrix for each model. These are fit and scored on the **same** data, so they measure training fit, not generalization (the Random Forest scores 100% on both ECoG and EEG there). They are left out of this README; use only the cross-validated numbers above.
+- Using all 160 ECoG channels instead of the posterior 100 gives lower CV accuracy (RF 57.1%, SVM 58.7%; see `logs/log1.txt`).
+- The 6 EEG sessions are recordings of the same video, so the same stimulus appears in several sessions. The folds are shuffled across sessions, not split by session.
+- Full logs for every run are in `logs/`.
